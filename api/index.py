@@ -15,6 +15,14 @@ from core.bandcamp import search as search_bandcamp
 
 app = Flask(__name__)
 
+# Repositorio no GitHub que roda o build automatico (.github/workflows/build-desktop.yml).
+# Troque para "SEU_USUARIO/NOME_DO_REPO" assim que o repositorio existir no GitHub.
+# Os links abaixo apontam pro release "latest", que o workflow sobrescreve a cada
+# push na main - o arquivo baixado muda, a URL nunca muda.
+GITHUB_REPO = "NiraslabDEV/Music-Agregador"
+MAC_DOWNLOAD_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/MusicAggregator-macOS.dmg"
+WINDOWS_DOWNLOAD_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/MusicAggregator-Windows.zip"
+
 
 HTML_PAGE = """
 <!doctype html>
@@ -36,12 +44,24 @@ HTML_PAGE = """
     .result { border: 1px solid #ececff; border-radius: 14px; padding: 14px; background: #fcfbff; }
     .pill { display: inline-block; padding: 6px 10px; border-radius: 999px; background: #eef0ff; margin-right: 8px; font-size: 13px; }
     .muted { color: #6f7390; }
+    .downloads { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 28px; }
+    .dl-btn { display: inline-flex; align-items: center; gap: 8px; background: #1f2340; color: white; text-decoration: none; padding: 12px 18px; border-radius: 12px; font-weight: 600; font-size: 14px; }
+    .dl-btn.mac { background: #111827; }
+    .dl-btn.win { background: #0f62fe; }
+    .dl-note { font-size: 12px; color: #6f7390; margin-top: -18px; margin-bottom: 26px; }
   </style>
 </head>
 <body>
   <main>
     <h1>Music Aggregator</h1>
-    <p class=\"muted\">Busque uma música e veja resultados do Beatport e Bandcamp em tempo real.</p>
+    <p class=\"muted\">Busque uma música e veja resultados do Beatport e Bandcamp em tempo real. Prefere o app de mesa? Ele também acha a melhor fonte grátis no Soulseek.</p>
+
+    <div class=\"downloads\">
+      <a class=\"dl-btn mac\" href=\"__MAC_DOWNLOAD_URL__\">⬇ Baixar para Mac</a>
+      <a class=\"dl-btn win\" href=\"__WINDOWS_DOWNLOAD_URL__\">⬇ Baixar para Windows</a>
+    </div>
+    <p class=\"dl-note\">O app é atualizado automaticamente aqui — esses links sempre apontam pra versão mais recente. No Mac, na primeira abertura: clique com o botão direito no app → \"Abrir\" (ele ainda não tem assinatura da Apple).</p>
+
     <div class=\"card\">
       <form id=\"searchForm\">
         <input id=\"query\" name=\"q\" placeholder=\"Ex.: Blue Monday\" required />
@@ -78,7 +98,7 @@ HTML_PAGE = """
   </script>
 </body>
 </html>
-"""
+""".replace("__MAC_DOWNLOAD_URL__", MAC_DOWNLOAD_URL).replace("__WINDOWS_DOWNLOAD_URL__", WINDOWS_DOWNLOAD_URL)
 
 
 def fetch_sources(query: str):

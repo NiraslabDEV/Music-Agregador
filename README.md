@@ -39,6 +39,35 @@ A pasta api agora expõe uma interface simples para uso na Vercel. Para publicar
 4. A aplicação ficará disponível em uma URL do Vercel.
 5. Se quiser, adicione uma variável de ambiente opcional `PORT` para testes locais; o deploy não precisa dela.
 
+## App instalável (Mac e Windows) com atualização automática
+
+Toda vez que um push cai na branch `main` (mudando `core/`, `ui/`, `main.py` etc.),
+o workflow `.github/workflows/build-desktop.yml` builda o app nativo pro Mac
+(`.dmg`) e pro Windows (`.zip`) via GitHub Actions e publica os dois num
+release do GitHub chamado sempre `latest` — o release é **substituído**, não
+acumulado, então o link de download nunca muda:
+
+```
+https://github.com/<usuario>/<repo>/releases/latest/download/MusicAggregator-macOS.dmg
+https://github.com/<usuario>/<repo>/releases/latest/download/MusicAggregator-Windows.zip
+```
+
+A página web (`api/index.py`) já tem os botões de download apontando pra essas
+URLs — basta ajustar a constante `GITHUB_REPO` no topo do arquivo pro
+`usuario/repo` real assim que o repositório existir no GitHub.
+
+Pré-requisitos únicos (feitos uma vez):
+1. Criar o repositório no GitHub e dar `git push` (o workflow já está pronto).
+2. Nenhuma conta paga é necessária — o app builda, mas não é assinado pela
+   Apple. Na primeira abertura no Mac, o usuário precisa clicar com o botão
+   direito no app → "Abrir" (o Gatekeeper bloqueia apps não assinados por
+   padrão). Assinatura oficial da Apple (opcional, remove esse aviso) exige
+   uma conta Apple Developer (US$99/ano).
+
+Dependências do app de mesa (Soulseek incluso) ficam em
+`requirements-desktop.txt`, separadas do `requirements.txt` usado pela Vercel
+(que só precisa de Flask, sem Flet/Flutter).
+
 ## Como funciona cada fonte
 
 **Beatport** (`core/beatport.py`) — sem autenticação. A própria página de busca
