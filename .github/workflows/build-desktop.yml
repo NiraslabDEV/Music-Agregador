@@ -56,7 +56,10 @@ jobs:
           path: dist/MusicAggregator-macOS.dmg
 
   build-windows:
-    runs-on: windows-latest
+    # Fixo (nao "windows-latest"): o Flutter 3.24.x (contemporaneo do Flet 0.24)
+    # nao reconhece o Visual Studio de imagens muito mais novas e quebra o
+    # CMake ("could not find any instance of Visual Studio").
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
