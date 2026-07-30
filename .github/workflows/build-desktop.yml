@@ -16,6 +16,7 @@ env:
   PROJECT_NAME: "Music Aggregator"
   ORG_NAME: "com.niraslab.musicaggregator"
   APP_DESCRIPTION: "Preco em cada loja + a melhor opcao gratis"
+  PYTHONUTF8: "1"
 
 jobs:
   build-macos:
@@ -29,7 +30,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: "3.24.5"
 
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
@@ -65,7 +66,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: "3.24.5"
 
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
