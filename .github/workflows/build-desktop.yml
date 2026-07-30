@@ -35,6 +35,9 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
 
+      - name: Gravar versao no app
+        run: sed -i.bak "s/^APP_BUILD_VERSION = .*/APP_BUILD_VERSION = \"$BUILD_VERSION\"/" main.py
+
       - name: Compilar app macOS
         run: >
           flet build macos
@@ -73,6 +76,11 @@ jobs:
 
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
+
+      - name: Gravar versao no app
+        shell: pwsh
+        run: |
+          (Get-Content main.py) -replace '^APP_BUILD_VERSION = .*', "APP_BUILD_VERSION = `"$env:BUILD_VERSION`"" | Set-Content main.py
 
       - name: Compilar app Windows
         shell: pwsh
@@ -117,6 +125,6 @@ jobs:
         run: |
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest dist/MusicAggregator-macOS.dmg dist/MusicAggregator-Windows.zip \
-            --title "Music Aggregator - build mais recente" \
+            --title "Music Aggregator v$BUILD_VERSION" \
             --notes "Build automatico a partir do commit ${{ github.sha }}. Este release e sempre substituido pelo build mais novo - os links de download nunca mudam." \
             --target "${{ github.sha }}"
