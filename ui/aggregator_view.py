@@ -9,11 +9,14 @@ por natureza, é basicamente uma lista de resultados.
 
 import threading
 import time
+from typing import Optional
 
 import flet as ft
 
 from core.aggregator import Aggregator, TrackResult
-from core.soulseek import DownloadJob, dedupe_by_file, parse_queries
+from core.soulseek import Candidate, DownloadJob, dedupe_by_file, parse_queries
+
+SOULSEEK_FORMATS = ("flac", "wav", "mp3")
 
 RENDER_INTERVAL = 0.8
 
@@ -544,40 +547,56 @@ class AggregatorView:
                                  BANDCAMP_SOFT, body)
 
     def _soulseek_panel(self, query: str, result: TrackResult) -> ft.Container:
-        best = result.soulseek_best
-        if not best:
+        by_format = result.soulseek_best_by_format
+        if not any(by_format.values()):
             hint = "conecte-se ao Soulseek" if not self.engine.is_connected else (
                 "não encontrado" if result.done else "buscando...")
             body = self._empty_body(hint)
         else:
             fontes = len(dedupe_by_file(result.soulseek))
             body = ft.Column([
-                ft.Text(best.filename, size=12, weight=ft.FontWeight.W_600, color=INK,
-                       no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
-                ft.Text(f"de {best.username}", size=11, color=MUTED,
-                       no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
                 ft.Row([
                     pill("Grátis", FREE_COLOR, FREE_SOFT, icon=ft.icons.CHECK_CIRCLE_ROUNDED),
-                    ft.Text(f"{best.quality_label} · {best.size_mb:.1f} MB", size=10, color=MUTED),
+                    ft.Text(_plural(fontes, "fonte"), size=10, color=MUTED),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                ft.Text(_plural(fontes, "fonte"), size=10, color=MUTED),
-                ft.ElevatedButton("Baixar grátis", icon=ft.icons.DOWNLOAD_ROUNDED,
-                                 style=pstyle(FREE_COLOR),
-                                 on_click=lambda e, q=query, r=result: self._download_best(q, r)),
-            ], spacing=4, tight=True)
+                *[self._format_row(query, result, fmt, by_format[fmt]) for fmt in SOULSEEK_FORMATS],
+            ], spacing=6, tight=True)
         return self._panel_shell(ft.icons.PEOPLE_ALT_ROUNDED, "Soulseek", SOULSEEK_NEUTRAL,
                                  "#F1F5F9", body)
 
-    def _download_best(self, query: str, result: TrackResult) -> None:
+    def _format_row(self, query: str, result: TrackResult, fmt: str,
+                    candidate: Optional[Candidate]) -> ft.Row:
+        tag = ft.Container(
+            content=ft.Text(fmt.upper(), size=9.5, weight=ft.FontWeight.BOLD, color=FREE_COLOR),
+            bgcolor=FREE_SOFT, padding=ft.padding.symmetric(horizontal=6, vertical=3),
+            border_radius=6, width=42, alignment=ft.alignment.center,
+        )
+        if not candidate:
+            return ft.Row([
+                tag,
+                ft.Text("indisponível", size=10, color=MUTED, italic=True, expand=True),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        detail = f"{candidate.quality_label} · {candidate.size_mb:.1f} MB"
+        return ft.Row([
+            tag,
+            ft.Text(detail, size=10, color=MUTED, expand=True,
+                   no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+            ft.IconButton(ft.icons.DOWNLOAD_ROUNDED, icon_size=17, icon_color=FREE_COLOR,
+                         tooltip=f"Baixar em {fmt.upper()} — de {candidate.username}",
+                         on_click=lambda e, q=query, r=result, c=candidate: self._download_candidate(q, r, c)),
+        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def _download_candidate(self, query: str, result: TrackResult, candidate: Candidate) -> None:
         if not self.engine.is_connected:
             self._snack("Conecte-se ao Soulseek primeiro.", ft.colors.ORANGE_700)
             return
-        pool = result.soulseek
-        best = dedupe_by_file(pool)[0] if pool else None
-        if not best:
-            return
-        self.engine.enqueue(best, pool=pool, label=query, on_update=self._on_job_update)
-        self.log(f"Na fila: {best.filename} ({best.quality_label}) de {best.username}")
+        # Fallback só entre fontes do mesmo formato: quem escolheu FLAC não quer
+        # que a fila caia num MP3 silenciosamente se a fonte escolhida falhar.
+        same_format_pool = [c for c in result.soulseek if c.ext == candidate.ext]
+        label = f"{query} · {candidate.ext.upper()}"
+        self.engine.enqueue(candidate, pool=same_format_pool, label=label,
+                            on_update=self._on_job_update)
+        self.log(f"Na fila: {candidate.filename} ({candidate.quality_label}) de {candidate.username}")
         self._render_jobs()
 
     # ================= fila de downloads =================

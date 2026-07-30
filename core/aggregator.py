@@ -51,6 +51,15 @@ class TrackResult:
         return dedupe_by_file(self.soulseek)[0] if self.soulseek else None
 
     @property
+    def soulseek_best_by_format(self) -> dict[str, Optional[Candidate]]:
+        """Melhor candidato em cada formato-alvo (FLAC, WAV, MP3), pra escolher."""
+        best: dict[str, Optional[Candidate]] = {"flac": None, "wav": None, "mp3": None}
+        for c in dedupe_by_file(self.soulseek):
+            if c.ext in best and best[c.ext] is None:
+                best[c.ext] = c
+        return best
+
+    @property
     def has_any(self) -> bool:
         return bool(self.beatport or self.bandcamp or self.soulseek)
 
