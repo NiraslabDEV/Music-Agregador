@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -74,6 +75,38 @@ JUNK_RE = re.compile(r"(preview|sample|snippet|teaser|jingle|\bdemo\b)", re.IGNO
 PATH_SPLIT_RE = re.compile(r"[\\/]")
 
 SERVER_DEFAULT = "server.slsknet.org"
+
+# O Soulseek precisa abrir uma porta de escuta (e a "obfuscada", porta+1) para
+# receber conexões de outros usuários. No Windows, faixas inteiras ficam
+# reservadas pelo Hyper-V/WSL e qualquer bind nelas falha com WinError 10013 —
+# inclusive na faixa da porta padrão 60000. Quando isso acontece o login morre
+# com "failed to connect non-obfuscated listening port", que não tem nada a ver
+# com usuário e senha. Por isso testamos o par de portas antes de conectar e,
+# se estiver bloqueado, caímos para a primeira porta livre.
+PORT_FALLBACKS = (61337, 62000, 58000, 55000, 49152)
+
+
+def _port_pair_is_free(port: int) -> bool:
+    """Testa se `port` e `port + 1` (obfuscada) podem ser abertas."""
+    for p in (port, port + 1):
+        if not (1024 < p < 65535):
+            return False
+        sock = socket.socket()
+        try:
+            sock.bind(("0.0.0.0", p))
+        except OSError:
+            return False
+        finally:
+            sock.close()
+    return True
+
+
+def find_free_listening_port(preferred: int) -> Optional[int]:
+    """Devolve uma porta de escuta utilizável, ou None se nenhuma servir."""
+    for port in (int(preferred), *PORT_FALLBACKS):
+        if _port_pair_is_free(port):
+            return port
+    return None
 
 
 def _data_dir() -> Path:
@@ -699,6 +732,21 @@ class SoulseekEngine:
             return False, "Preencha usuário e senha do Soulseek."
         if self.is_connected:
             return True, "Já conectado."
+
+        port = find_free_listening_port(self.config.listening_port)
+        if port is None:
+            return False, (
+                f"A porta {self.config.listening_port} está bloqueada pelo Windows "
+                "e nenhuma alternativa funcionou. Escolha outra porta de escuta "
+                "nas configurações."
+            )
+        if port != int(self.config.listening_port):
+            self.log(
+                f"Porta {self.config.listening_port} indisponível neste computador "
+                f"(reservada pelo sistema). Usando {port}."
+            )
+            self.config.listening_port = port
+            self.config.save()
 
         try:
             return self._run(self._connect_async(), timeout=timeout)
