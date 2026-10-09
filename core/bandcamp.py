@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -44,6 +45,13 @@ REQUEST_TIMEOUT = 15
 
 FREE_DOWNLOAD_PREF = 1   # constante 'FREE' do próprio payload do Bandcamp
 
+# Sem isso, todo subprocess.run(["curl", ...]) abre e fecha rapidinho uma
+# janela de console preta no Windows — visível e irritante num app que roda
+# sem console próprio (Flet/janela nativa). A cada busca no Bandcamp isso
+# dispara vários curls (busca + preço de cada resultado + prévia), então
+# a janelinha "pipoca" na tela repetidamente sem esse flag.
+_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 
 def _curl(args: list[str], timeout: float) -> Optional[str]:
     """Roda `curl.exe` com os argumentos dados e devolve o stdout (texto).
@@ -55,6 +63,7 @@ def _curl(args: list[str], timeout: float) -> Optional[str]:
         result = subprocess.run(
             ["curl", "-s", "--max-time", str(int(timeout) + 2), *args],
             capture_output=True, timeout=timeout + 5,
+            creationflags=_SUBPROCESS_FLAGS,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
@@ -187,6 +196,32 @@ def _fill_price(track: BandcampTrack, timeout: float) -> None:
             )
         except (TypeError, ValueError):
             pass
+
+
+def get_preview_url(track_url: str, timeout: float = REQUEST_TIMEOUT) -> Optional[str]:
+    """Stream grátis de 128kbps que a própria página do Bandcamp usa antes da
+    compra — mesmo em faixa paga (é assim que o "pague o quanto quiser"
+    funciona: dá pra ouvir a faixa inteira de graça, só não baixar).
+
+    Sob demanda (não busca isso pra cada resultado): a URL tem token com
+    validade curta, então só faz sentido buscar quando a pessoa for tocar.
+    Confirmado ao vivo (2026-07-31): trackinfo[0].file["mp3-128"] no mesmo
+    JSON `data-tralbum` que já é lido pra pegar o preço.
+    """
+    page = _curl_get(track_url, timeout)
+    if not page:
+        return None
+    match = TRALBUM_RE.search(page)
+    if not match:
+        return None
+    try:
+        data = json.loads(html.unescape(match.group(1)))
+        trackinfo = data.get("trackinfo") or []
+        if not trackinfo:
+            return None
+        return (trackinfo[0].get("file") or {}).get("mp3-128") or None
+    except (ValueError, json.JSONDecodeError):
+        return None
 
 
 def best_match(query: str, limit: int = 5) -> Optional[BandcampTrack]:

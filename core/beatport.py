@@ -25,6 +25,9 @@ from typing import Optional
 import requests
 
 SEARCH_URL = "https://www.beatport.com/search"
+# A busca não traz preview — só a página da própria faixa. "x" no lugar do
+# slug funciona: o Beatport resolve pelo ID e ignora o texto do slug.
+TRACK_URL = "https://www.beatport.com/track/x/{track_id}"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
@@ -149,6 +152,34 @@ def _track_from_json(item: dict, query: str) -> Optional[BeatportTrack]:
             query=query,
         )
     except (TypeError, ValueError):
+        return None
+
+
+def get_preview_url(track_id: int, timeout: float = REQUEST_TIMEOUT) -> Optional[str]:
+    """Busca o preview de 30s (lo-fi, MP3) de uma faixa — sob demanda.
+
+    Só a página da própria faixa tem esse dado (`sample_url` dentro do
+    __NEXT_DATA__), a busca não traz. Por isso isso é uma chamada à parte,
+    feita só quando a pessoa clica em "ouvir" — nunca em massa pra cada
+    resultado de busca, senão vira uma rajada de requests desnecessária.
+    Confirmado ao vivo (2026-07-31): GET /track/x/{id} devolve 200 com
+    props.pageProps.track.sample_url.
+    """
+    if not track_id:
+        return None
+    try:
+        resp = requests.get(TRACK_URL.format(track_id=track_id), headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    match = NEXT_DATA_RE.search(resp.text)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+        return data["props"]["pageProps"]["track"].get("sample_url") or None
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 

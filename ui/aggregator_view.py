@@ -9,12 +9,16 @@ por natureza, é basicamente uma lista de resultados.
 
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import flet as ft
 
+from core import bandcamp, beatport, youtube
 from core.aggregator import Aggregator, TrackResult
-from core.soulseek import Candidate, DownloadJob, dedupe_by_file, parse_queries
+from core.ai_providers import PROVIDERS, AISettings
+from core.soulseek import Candidate, DownloadJob, dedupe_by_file
+from core.tracklist_parser import parse_tracklist_to_queries
+from core.youtube import YouTubeConfig
 
 SOULSEEK_FORMATS = ("flac", "wav", "mp3")
 
@@ -128,6 +132,10 @@ class AggregatorView:
         self.aggregator = Aggregator(log_callback=self.log)
         self.engine = self.aggregator.soulseek
         self.config = self.engine.config
+        self.ai_settings = AISettings.load()
+        self.youtube_config = YouTubeConfig.load()
+        self._playing_key: Optional[str] = None
+        self._paused_key: Optional[str] = None
 
         self.result_groups: dict[str, TrackResult] = {}
         self.searching = {"value": False}
@@ -135,7 +143,12 @@ class AggregatorView:
         self._render_lock = threading.Lock()
 
         self._build_controls()
-        self.control = self._build_layout()
+        self._main_layout = self._build_layout()
+        self._login_screen = self._build_login_screen()
+        # Sempre entra pela tela de login — mesmo com credenciais salvas, a
+        # pessoa dá o clique em "Conectar" (mas os campos já vêm preenchidos).
+        self.control = ft.Container(content=self._login_screen, expand=True,
+                                    bgcolor=PAGE_BG)
         self._render_results()
         self._render_jobs()
 
@@ -191,18 +204,67 @@ class AggregatorView:
             content=ft.Row([self.status_dot, self.status_text], spacing=8,
                            tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             bgcolor="#F1F0F9", padding=ft.padding.symmetric(horizontal=12, vertical=8),
-            border_radius=20,
+            border_radius=20, tooltip="Gerenciar conta",
+            on_click=lambda e: self._show_login_screen(),
         )
-        self.connect_btn = ft.ElevatedButton("Conectar", icon=ft.icons.POWER_SETTINGS_NEW,
-                                             style=pstyle(SOULSEEK_NEUTRAL),
-                                             on_click=self._toggle_connection)
+        # Botão único: conecta na tela de entrada, e também serve pra
+        # desconectar quando a pessoa volta nela pelo status pill.
+        self.login_btn = ft.ElevatedButton(
+            "Conectar", icon=ft.icons.ARROW_FORWARD_ROUNDED, height=50,
+            style=pstyle(PRIMARY), on_click=lambda e: self._do_login(),
+        )
+        self.login_error_text = ft.Text("", size=12, color="#DC2626", visible=False)
         self.folder_picker = ft.FilePicker(on_result=self._on_folder_picked)
         self.page.overlay.append(self.folder_picker)
 
+        # Player único, reaproveitado por todas as prévias (Beatport/Bandcamp):
+        # tocar uma nova troca o `src` da mesma instância, então só uma prévia
+        # toca por vez — sem precisar de um Audio por resultado. Criado só na
+        # primeira prévia (não agora): o controle Audio do Flet exige um `src`
+        # não-vazio já no primeiro `page.update()`, e ainda não temos URL nenhuma.
+        self.audio_player: Optional[ft.Audio] = None
+
+        # Barra "tocando agora", fixa embaixo da área rolável (não some ao
+        # rolar a lista de resultados) — mostra o que está tocando e dá
+        # controle de pausar/retomar/parar sem precisar achar o card de novo.
+        self.now_playing_icon = ft.Icon(ft.icons.GRAPHIC_EQ_ROUNDED, color=ft.colors.WHITE, size=18)
+        self.now_playing_title = ft.Text("", size=13, weight=ft.FontWeight.BOLD,
+                                         color=ft.colors.WHITE, no_wrap=True,
+                                         overflow=ft.TextOverflow.ELLIPSIS)
+        self.now_playing_subtitle = ft.Text("", size=11,
+                                            color=ft.colors.with_opacity(0.75, ft.colors.WHITE),
+                                            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS)
+        self.now_playing_time = ft.Text("", size=11,
+                                        color=ft.colors.with_opacity(0.75, ft.colors.WHITE))
+        self.now_playing_toggle_btn = ft.IconButton(
+            ft.icons.PAUSE_CIRCLE_ROUNDED, icon_color=ft.colors.WHITE, icon_size=28,
+            tooltip="Pausar", on_click=lambda e: self._now_playing_toggle_click(),
+        )
+        self.now_playing_stop_btn = ft.IconButton(
+            ft.icons.STOP_CIRCLE_ROUNDED, icon_color=ft.colors.WHITE, icon_size=28,
+            tooltip="Parar", on_click=lambda e: self._stop_preview(),
+        )
+        self.now_playing_bar = ft.Container(
+            visible=False, bgcolor=PRIMARY_DARK,
+            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+            content=ft.Row([
+                self.now_playing_icon,
+                ft.Column([self.now_playing_title, self.now_playing_subtitle],
+                         spacing=0, tight=True, expand=True),
+                self.now_playing_time,
+                self.now_playing_toggle_btn,
+                self.now_playing_stop_btn,
+            ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+        self._now_playing_call: Optional[Callable[[], None]] = None
+        self._now_playing_meta: tuple[str, str] = ("", "")
+        self._start_now_playing_ticker()
+
         self.query_field = ft.TextField(
-            label="Faixa (ou várias, separadas por vírgula)",
-            hint_text="New Order - Blue Monday, Daft Punk - Around The World",
-            height=56, expand=True, **field_style,
+            label="Faixa, lista separada por vírgula, ou um tracklist colado inteiro",
+            hint_text="New Order - Blue Monday, Daft Punk - Around The World  ·  ou cole um "
+                     "tracklist com horário e gravadora que a gente limpa sozinho",
+            multiline=True, min_lines=1, max_lines=8, expand=True, **field_style,
         )
         self.window_dd = ft.Dropdown(
             label="Coleta Soulseek", width=150, height=56, value="10",
@@ -212,6 +274,12 @@ class AggregatorView:
         self.search_btn = ft.ElevatedButton("Buscar", icon=ft.icons.SEARCH, height=56,
                                             style=pstyle(PRIMARY),
                                             on_click=lambda e: self._start_search())
+        self.ai_settings_btn = ft.IconButton(
+            ft.icons.SMART_TOY_OUTLINED, icon_color=MUTED, height=56,
+            tooltip="Configurar IA para linhas de tracklist que o regex não entender",
+            on_click=lambda e: self._open_ai_settings(),
+        )
+        self._build_ai_settings_dialog()
         self.search_progress = ft.ProgressBar(value=0, color=PRIMARY,
                                               bgcolor=PRIMARY_SOFT, visible=False,
                                               border_radius=4)
@@ -224,34 +292,328 @@ class AggregatorView:
 
         self.log_area = ft.ListView(expand=True, spacing=3, auto_scroll=True, height=120)
 
-    def _build_layout(self):
-        conn_card = card(
-            section_title(ft.icons.CLOUD_SYNC, "Conta Soulseek",
-                          "Não existe cadastro no site — a conta nasce no primeiro login. "
-                          "Escolha nome e senha; se já existir, a senha precisa bater.",
-                          color=SOULSEEK_NEUTRAL),
-            ft.Container(
-                content=ft.Column([
-                    ft.Row([self.user_field, self.pass_field], spacing=10),
-                    ft.Row([
-                        ft.OutlinedButton("Pasta de downloads", icon=ft.icons.FOLDER_OPEN,
-                                         style=outline_style(SOULSEEK_NEUTRAL),
-                                         on_click=lambda e: self.folder_picker.get_directory_path(
-                                             dialog_title="Onde salvar as músicas do Soulseek")),
-                        self.folder_text,
-                    ], spacing=10),
-                    self.share_check,
-                ], spacing=10),
-                bgcolor="#FAFAFD", border_radius=RADIUS_MD, padding=14,
-            ),
-            ft.Row([self.connect_btn, ft.Container(expand=True), self.status_pill]),
+    def _build_ai_settings_dialog(self) -> None:
+        field_style = dict(
+            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC",
+            border_color="transparent", focused_border_color=PRIMARY, height=50,
         )
+        self.ai_provider_dd = ft.Dropdown(
+            label="Provedor padrão", value=self.ai_settings.active_provider,
+            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC", border_color="transparent",
+            options=[ft.dropdown.Option(p.id, p.label) for p in PROVIDERS.values()],
+        )
+        self.ai_key_fields: dict[str, ft.TextField] = {}
+        key_rows = []
+        for provider in PROVIDERS.values():
+            key_field = ft.TextField(
+                label=f"Chave da API — {provider.label}",
+                value=self.ai_settings.keys.get(provider.id, ""),
+                password=True, can_reveal_password=True, **field_style,
+            )
+            self.ai_key_fields[provider.id] = key_field
+            key_rows.append(ft.Column([
+                key_field,
+                ft.Text(provider.signup_hint, size=11, color=MUTED),
+            ], spacing=4, tight=True))
+
+        self.youtube_key_field = ft.TextField(
+            label="Chave da API — YouTube Data v3",
+            value=self.youtube_config.api_key,
+            password=True, can_reveal_password=True, **field_style,
+        )
+
+        self.ai_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Chaves de API — IA e YouTube", weight=ft.FontWeight.BOLD,
+                          color=INK),
+            content=ft.Container(
+                width=420, height=480,
+                content=ft.Column([
+                    ft.Text("O regex já resolve a maioria dos tracklists colados — a IA só "
+                           "entra em ação nas poucas linhas que ele não conseguir separar em "
+                           "artista/faixa. O YouTube é usado como opção de \"ouvir\" quando a "
+                           "faixa não aparece no Beatport nem no Bandcamp. Nada aqui é "
+                           "obrigatório.", size=12, color=MUTED),
+                    self.ai_provider_dd,
+                    *key_rows,
+                    ft.Divider(height=1, color="#EEEDF8"),
+                    ft.Column([
+                        self.youtube_key_field,
+                        ft.Text("Chave grátis em console.cloud.google.com "
+                               "(ative \"YouTube Data API v3\").", size=11, color=MUTED),
+                    ], spacing=4, tight=True),
+                ], spacing=14, tight=True, scroll=ft.ScrollMode.AUTO),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: self._close_ai_settings()),
+                ft.ElevatedButton("Salvar", style=pstyle(PRIMARY),
+                                  on_click=lambda e: self._save_ai_settings()),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.overlay.append(self.ai_dialog)
+
+    def _open_ai_settings(self) -> None:
+        self.page.dialog = self.ai_dialog
+        self.ai_dialog.open = True
+        self._safe_update()
+
+    def _close_ai_settings(self) -> None:
+        self.ai_dialog.open = False
+        self._safe_update()
+
+    def _save_ai_settings(self) -> None:
+        self.ai_settings.active_provider = self.ai_provider_dd.value or "glm"
+        for provider_id, key_field in self.ai_key_fields.items():
+            self.ai_settings.keys[provider_id] = (key_field.value or "").strip()
+        self.ai_settings.save()
+        self.youtube_config.api_key = (self.youtube_key_field.value or "").strip()
+        self.youtube_config.save()
+        self._close_ai_settings()
+        self._snack("Chaves salvas.", FREE_COLOR)
+
+    # ================= prévia de áudio =================
+
+    def _on_audio_state(self, e) -> None:
+        if e.data in ("completed", "stopped"):
+            self._playing_key = None
+            self._paused_key = None
+            self._now_playing_call = None
+            self._update_now_playing_bar()
+            self._render_results()
+
+    def _toggle_preview(self, key: str, fetch_fn, title: str = "", subtitle: str = "") -> None:
+        """Toca/pausa/retoma a prévia de uma faixa.
+
+        Três casos: já tocando essa faixa -> pausa no lugar; pausada nessa
+        mesma faixa -> retoma do ponto onde parou; qualquer outro caso ->
+        busca a URL (sob demanda) e começa do zero. `fetch_fn` só é chamado
+        nesse último caso. `title`/`subtitle` só servem pra popular a barra
+        "tocando agora" — não são usados nos dois primeiros casos.
+        """
+        if self._playing_key == key and self.audio_player is not None:
+            try:
+                self.audio_player.pause()
+            except Exception as ex:
+                self.log(f"Erro ao pausar prévia: {ex}")
+            self._playing_key = None
+            self._paused_key = key
+            self._update_now_playing_bar()
+            self._render_results()
+            return
+
+        if self._paused_key == key and self.audio_player is not None:
+            try:
+                self.audio_player.resume()
+            except Exception as ex:
+                self.log(f"Erro ao retomar prévia: {ex}")
+            self._paused_key = None
+            self._playing_key = key
+            self._update_now_playing_bar()
+            self._render_results()
+            return
+
+        self._paused_key = None
+        self._playing_key = f"loading:{key}"
+        self._now_playing_call = lambda: self._toggle_preview(key, fetch_fn, title, subtitle)
+        self._now_playing_meta = (title, subtitle)
+        self._render_results()
+
+        def worker():
+            url = None
+            try:
+                url = fetch_fn()
+            except Exception as ex:
+                self.log(f"Erro ao buscar prévia: {ex}")
+            if not url:
+                self._playing_key = None
+                self._now_playing_call = None
+                self._snack("Prévia não disponível para essa faixa.", ft.colors.ORANGE_700)
+                self._render_results()
+                return
+            if self.audio_player is None:
+                # Só é criado agora, com um `src` de verdade — o controle Audio
+                # do Flet quebra a renderização se for montado com src vazio.
+                self.audio_player = ft.Audio(src=url, autoplay=True,
+                                             on_state_changed=self._on_audio_state)
+                self.page.overlay.append(self.audio_player)
+            else:
+                # Trocar só o `src` às vezes não reinicia o player de verdade
+                # (fica "preso" no estado da prévia anterior) — soltar antes
+                # força o recarregamento limpo.
+                try:
+                    self.audio_player.release()
+                except Exception:
+                    pass
+                self.audio_player.src = url
+                self.audio_player.autoplay = True
+            self._playing_key = key
+            self.log(f"Tocando prévia: {url}")
+            try:
+                self.audio_player.play()
+            except Exception as ex:
+                self.log(f"Erro ao chamar play(): {ex}")
+            self._update_now_playing_bar()
+            self._render_results()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_preview(self) -> None:
+        """Para de vez (diferente de pausar): solta o player e some com a barra."""
+        if self.audio_player is not None:
+            try:
+                self.audio_player.release()
+            except Exception:
+                pass
+        self._playing_key = None
+        self._paused_key = None
+        self._now_playing_call = None
+        self._update_now_playing_bar()
+        self._render_results()
+
+    def _now_playing_toggle_click(self) -> None:
+        if self._now_playing_call:
+            self._now_playing_call()
+
+    def _update_now_playing_bar(self) -> None:
+        active_key = self._playing_key or self._paused_key
+        if not active_key or active_key.startswith("loading:") or not self._now_playing_call:
+            self.now_playing_bar.visible = False
+            self._safe_update()
+            return
+
+        title, subtitle = getattr(self, "_now_playing_meta", ("", ""))
+        self.now_playing_title.value = title or "Prévia"
+        self.now_playing_subtitle.value = subtitle
+        is_paused = self._paused_key == active_key
+        self.now_playing_toggle_btn.icon = (
+            ft.icons.PLAY_CIRCLE_ROUNDED if is_paused else ft.icons.PAUSE_CIRCLE_ROUNDED)
+        self.now_playing_toggle_btn.tooltip = "Retomar" if is_paused else "Pausar"
+        if is_paused:
+            self.now_playing_time.value = f"{self.now_playing_time.value.split(' / ')[0]} · pausado" \
+                if self.now_playing_time.value else "pausado"
+        self.now_playing_bar.visible = True
+        self._safe_update()
+
+    @staticmethod
+    def _fmt_ms(ms: Optional[int]) -> str:
+        if not ms or ms < 0:
+            return "0:00"
+        s = int(ms / 1000)
+        m, s = divmod(s, 60)
+        return f"{m}:{s:02d}"
+
+    def _start_now_playing_ticker(self) -> None:
+        """Uma única thread de fundo, pra vida toda do app, que atualiza o
+        tempo decorrido da prévia enquanto algo está tocando — evita criar
+        uma thread nova a cada play."""
+
+        def tick():
+            while True:
+                time.sleep(1)
+                if self.audio_player is None or not self._playing_key or \
+                        self._playing_key.startswith("loading:"):
+                    continue
+                try:
+                    pos = self.audio_player.get_current_position(wait_timeout=1.5)
+                    dur = self.audio_player.get_duration(wait_timeout=1.5)
+                except Exception:
+                    continue
+                if pos is None:
+                    continue
+                self.now_playing_time.value = f"{self._fmt_ms(pos)} / {self._fmt_ms(dur)}"
+                try:
+                    self.now_playing_time.update()
+                except Exception:
+                    pass
+
+        threading.Thread(target=tick, daemon=True).start()
+
+    def _preview_button(self, key: str, color: str, fetch_fn,
+                        title: str = "", subtitle: str = "") -> ft.IconButton:
+        loading = self._playing_key == f"loading:{key}"
+        playing = self._playing_key == key
+        paused = self._paused_key == key
+        icon = ft.icons.HOURGLASS_TOP_ROUNDED if loading else (
+            ft.icons.PAUSE_CIRCLE_ROUNDED if playing else ft.icons.PLAY_CIRCLE_OUTLINE_ROUNDED)
+        tooltip = "Pausar prévia" if playing else (
+            "Retomar prévia" if paused else "Ouvir prévia de ~30s")
+        return ft.IconButton(
+            icon, icon_color=color, icon_size=26, disabled=loading,
+            tooltip=tooltip,
+            on_click=lambda e: self._toggle_preview(key, fetch_fn, title, subtitle),
+        )
+
+    def _open_youtube_listen(self, query: str) -> None:
+        api_key = self.youtube_config.api_key
+        if not api_key:
+            self._snack("Configure a chave do YouTube primeiro (ícone do robô).",
+                        ft.colors.ORANGE_700)
+            self._open_ai_settings()
+            return
+
+        def worker():
+            video = youtube.best_match(query, api_key)
+            if video:
+                self.page.launch_url(video.url)
+            else:
+                self._snack("Nada encontrado no YouTube para essa busca.", ft.colors.ORANGE_700)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_login_screen(self) -> ft.Container:
+        """Primeira tela do app: uma conta só, sem mencionar a rede por trás
+        (Soulseek) — a pessoa só vê "conectar" e ganha acesso a tudo."""
+        icon_badge = ft.Container(
+            content=ft.Icon(ft.icons.ALBUM_ROUNDED, color=ft.colors.WHITE, size=30),
+            width=64, height=64, border_radius=18,
+            gradient=HEADER_GRADIENT, alignment=ft.alignment.center,
+        )
+        login_card = ft.Container(
+            content=ft.Column([
+                icon_badge,
+                ft.Text("Music Aggregator", size=22, weight=ft.FontWeight.BOLD, color=INK),
+                ft.Text(
+                    "Uma conta só te dá acesso a preço em cada loja, prévia pra "
+                    "confirmar a faixa e download grátis.",
+                    size=13, color=MUTED, text_align=ft.TextAlign.CENTER,
+                ),
+                ft.Container(height=6),
+                self.user_field,
+                self.pass_field,
+                self.login_error_text,
+                self.login_btn,
+                ft.Text(
+                    "Criada automaticamente no primeiro acesso — sem cadastro em "
+                    "site nenhum.",
+                    size=11, color=MUTED, text_align=ft.TextAlign.CENTER,
+                ),
+                ft.Divider(height=1, color="#EEEDF8"),
+                ft.Row([
+                    ft.OutlinedButton("Pasta de downloads", icon=ft.icons.FOLDER_OPEN,
+                                     style=outline_style(MUTED),
+                                     on_click=lambda e: self.folder_picker.get_directory_path(
+                                         dialog_title="Onde salvar as músicas baixadas")),
+                    self.folder_text,
+                ], spacing=10),
+                self.share_check,
+            ], spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+               width=340),
+            bgcolor=ft.colors.WHITE, border_radius=RADIUS_LG, padding=32,
+            border=ft.border.all(1, "#EBE9F7"), shadow=soft_shadow(blur=30, dy=10, opacity=0.10),
+        )
+        return ft.Container(content=login_card, alignment=ft.alignment.center, expand=True)
+
+    def _build_layout(self):
+        account_bar = ft.Row([ft.Container(expand=True), self.status_pill],
+                             alignment=ft.MainAxisAlignment.END)
 
         search_card = card(
             section_title(ft.icons.SEARCH, "Buscar faixa",
                           "Mostra onde comprar (Beatport, Bandcamp) e a melhor opção grátis "
                           "no Soulseek, lado a lado.", color=PRIMARY),
-            ft.Row([self.query_field, self.window_dd, self.search_btn], spacing=10),
+            ft.Row([self.query_field, self.window_dd, self.search_btn, self.ai_settings_btn],
+                  spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             self.search_progress,
             ft.Row([
                 pill("Beatport", BEATPORT_COLOR, BEATPORT_SOFT, size=11, icon=ft.icons.SELL_OUTLINED),
@@ -282,10 +644,13 @@ class AggregatorView:
                         border_radius=RADIUS_MD, padding=10),
         )
 
-        return ft.Column(
-            [conn_card, search_card, results_card, jobs_card, log_card],
+        scrollable = ft.Column(
+            [account_bar, search_card, results_card, jobs_card, log_card],
             scroll=ft.ScrollMode.AUTO, expand=True, spacing=16,
         )
+        # A barra "tocando agora" fica fora da área rolável — sempre visível,
+        # não some quando a lista de resultados rola pra baixo.
+        return ft.Column([scrollable, self.now_playing_bar], expand=True, spacing=0)
 
     # ================= conexão =================
 
@@ -309,40 +674,71 @@ class AggregatorView:
         self.status_text.value = text
         self.status_text.color = color
 
-    def _toggle_connection(self, e=None) -> None:
+    @staticmethod
+    def _debrand(msg: str) -> str:
+        """Mensagens do motor às vezes citam "Soulseek" (útil no log técnico),
+        mas a tela de entrada não deve expor esse nome — vira "sistema"."""
+        return msg.replace("Soulseek", "sistema").replace("soulseek", "sistema")
+
+    def _show_login_screen(self) -> None:
+        self.login_error_text.visible = False
+        if self.engine.is_connected:
+            self.login_btn.text = "Desconectar"
+            self.login_btn.icon = ft.icons.LOGOUT_ROUNDED
+        else:
+            self.login_btn.text = "Conectar"
+            self.login_btn.icon = ft.icons.ARROW_FORWARD_ROUNDED
+        self.control.content = self._login_screen
+        self._safe_update()
+
+    def _show_main_app(self) -> None:
+        self.control.content = self._main_layout
+        self._render_results()
+        self._render_jobs()
+        self._safe_update()
+
+    def _do_login(self) -> None:
         if self.engine.is_connected:
             self.engine.disconnect()
             self._set_status(MUTED, "Desconectado")
-            self.connect_btn.text = "Conectar"
+            self.login_btn.text = "Conectar"
+            self.login_btn.icon = ft.icons.ARROW_FORWARD_ROUNDED
             self._safe_update()
             return
 
         self._save_from_fields()
         if not self.config.username or not self.config.password:
-            self._snack("Preencha usuário e senha do Soulseek.", ft.colors.RED_600)
+            self.login_error_text.value = "Preencha usuário e senha."
+            self.login_error_text.visible = True
+            self._safe_update()
             return
 
-        self.connect_btn.disabled = True
+        self.login_btn.disabled = True
+        self.login_btn.text = "Conectando..."
+        self.login_error_text.visible = False
         self._set_status("#D97706", "Conectando...")
         self._safe_update()
 
         def worker():
             ok, msg = self.engine.connect()
-            self.connect_btn.disabled = False
+            self.login_btn.disabled = False
             if ok:
                 self._set_status(FREE_COLOR, f"Conectado como {self.config.username}")
-                self.connect_btn.text = "Desconectar"
+                self._show_main_app()
             else:
+                self.login_btn.text = "Conectar"
                 self._set_status("#DC2626", "Falha ao conectar")
-                self._snack(msg, ft.colors.RED_600)
-            self._safe_update()
+                self.login_error_text.value = self._debrand(msg)
+                self.login_error_text.visible = True
+                self._safe_update()
 
         threading.Thread(target=worker, daemon=True).start()
 
     # ================= busca =================
 
     def _start_search(self) -> None:
-        queries = parse_queries(self.query_field.value or "")
+        raw = self.query_field.value or ""
+        queries = parse_tracklist_to_queries(raw, ai_settings=self.ai_settings, log=self.log)
         if not queries:
             self._snack("Digite ao menos uma faixa.", ft.colors.ORANGE_700)
             return
@@ -461,6 +857,12 @@ class AggregatorView:
                         ], spacing=6),
                     ], spacing=4, tight=True, expand=True,
                        alignment=ft.MainAxisAlignment.CENTER),
+                    ft.IconButton(
+                        ft.icons.SMART_DISPLAY_OUTLINED, icon_color=MUTED, icon_size=22,
+                        tooltip="Ouvir no YouTube (abre no navegador) — bom pra faixa que "
+                               "não apareceu no Beatport/Bandcamp",
+                        on_click=lambda e, q=query: self._open_youtube_listen(q),
+                    ),
                 ], spacing=12),
                 ft.Row([
                     self._beatport_panel(result),
@@ -518,9 +920,15 @@ class AggregatorView:
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 ft.Text(t.label, size=10, color=MUTED,
                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
-                ft.OutlinedButton("Ver no Beatport", icon=ft.icons.OPEN_IN_NEW,
-                                 style=outline_style(BEATPORT_COLOR),
-                                 url=t.url, url_target=ft.UrlTarget.BLANK),
+                ft.Row([
+                    ft.OutlinedButton("Ver no Beatport", icon=ft.icons.OPEN_IN_NEW,
+                                     style=outline_style(BEATPORT_COLOR), expand=True,
+                                     url=t.url, url_target=ft.UrlTarget.BLANK),
+                    self._preview_button(f"beatport:{t.track_id}", BEATPORT_COLOR,
+                                        lambda tid=t.track_id: beatport.get_preview_url(tid),
+                                        title=t.full_title,
+                                        subtitle=f"{t.artist_label} · Beatport"),
+                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ], spacing=4, tight=True)
         return self._panel_shell(ft.icons.SELL_ROUNDED, "Beatport", BEATPORT_COLOR,
                                  BEATPORT_SOFT, body)
@@ -539,9 +947,15 @@ class AggregatorView:
                     pill(t.price_label, BANDCAMP_COLOR, BANDCAMP_SOFT),
                     ft.Text(t.item_type, size=10, color=MUTED),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                ft.OutlinedButton("Ver no Bandcamp", icon=ft.icons.OPEN_IN_NEW,
-                                 style=outline_style(BANDCAMP_COLOR),
-                                 url=t.url, url_target=ft.UrlTarget.BLANK),
+                ft.Row([
+                    ft.OutlinedButton("Ver no Bandcamp", icon=ft.icons.OPEN_IN_NEW,
+                                     style=outline_style(BANDCAMP_COLOR), expand=True,
+                                     url=t.url, url_target=ft.UrlTarget.BLANK),
+                    self._preview_button(f"bandcamp:{t.url}", BANDCAMP_COLOR,
+                                        lambda u=t.url: bandcamp.get_preview_url(u),
+                                        title=t.title,
+                                        subtitle=f"{t.artist} · Bandcamp"),
+                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ], spacing=4, tight=True)
         return self._panel_shell(ft.icons.SELL_ROUNDED, "Bandcamp", BANDCAMP_COLOR,
                                  BANDCAMP_SOFT, body)
@@ -549,7 +963,7 @@ class AggregatorView:
     def _soulseek_panel(self, query: str, result: TrackResult) -> ft.Container:
         by_format = result.soulseek_best_by_format
         if not any(by_format.values()):
-            hint = "conecte-se ao Soulseek" if not self.engine.is_connected else (
+            hint = "conecte sua conta" if not self.engine.is_connected else (
                 "não encontrado" if result.done else "buscando...")
             body = self._empty_body(hint)
         else:
@@ -588,7 +1002,8 @@ class AggregatorView:
 
     def _download_candidate(self, query: str, result: TrackResult, candidate: Candidate) -> None:
         if not self.engine.is_connected:
-            self._snack("Conecte-se ao Soulseek primeiro.", ft.colors.ORANGE_700)
+            self._snack("Conecte sua conta primeiro.", ft.colors.ORANGE_700)
+            self._show_login_screen()
             return
         # Fallback só entre fontes do mesmo formato: quem escolheu FLAC não quer
         # que a fila caia num MP3 silenciosamente se a fonte escolhida falhar.
