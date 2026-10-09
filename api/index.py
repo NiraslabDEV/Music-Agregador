@@ -405,19 +405,19 @@ HTML_PAGE = """
 
   <section id=\"download\" class=\"wrap\">
     <div class=\"download-panel\">
-      <h2>Leve o app pra sua mesa</h2>
-      <p>Mac ou Windows — o instalador é sempre o build mais recente. Você atualiza o código aqui, todo mundo que já baixou pega a versão nova no próximo download.</p>
+      <h2>Baixe o Music Aggregator</h2>
+      <p>Escolha seu computador abaixo. O download começa direto pelo botão, com a versão mais recente. Não precisa saber programação.</p>
       <div class=\"download-ctas\">
         <a class=\"btn btn-mac\" href=\"__MAC_DOWNLOAD_URL__\">
           <svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M16.365 1.43c0 1.14-.47 2.11-1.19 2.86-.79.83-2.03 1.45-3.05 1.37-.13-1.09.43-2.24 1.15-2.96.78-.81 2.13-1.42 3.09-1.27ZM20.9 17.4c-.52 1.2-.76 1.74-1.42 2.8-.92 1.48-2.22 3.33-3.83 3.35-1.43.02-1.8-.93-3.74-.92-1.94.01-2.35.94-3.78.92-1.6-.02-2.83-1.68-3.75-3.16-2.57-4.1-2.84-8.9-1.25-11.46 1.13-1.82 2.9-2.89 4.57-2.89 1.7 0 2.77 1 4.18 1 1.36 0 2.2-1 4.18-1 1.49 0 3.07.81 4.19 2.21-3.69 2.02-3.09 7.28.65 9.15Z\"/></svg>
-          Baixar .dmg
+          Baixar para Mac
         </a>
         <a class=\"btn btn-win\" href=\"__WINDOWS_DOWNLOAD_URL__\">
           <svg width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M3 5.5 10.4 4.5V11.4H3V5.5ZM11.3 4.35 21 3V11.3H11.3V4.35ZM3 12.4H10.4V19.4L3 18.4V12.4ZM11.3 12.4H21V20.9L11.3 19.6V12.4Z\"/></svg>
-          Baixar .zip
+          Baixar para Windows
         </a>
       </div>
-      <p class=\"download-foot\">Build automático via GitHub Actions a cada atualização do código-fonte.</p>
+      <p class=\"download-foot\">Windows: depois de baixar, clique com o botão direito no arquivo → Extrair tudo. Abra a pasta extraída e dê dois cliques no programa.<br>Mac: abra o arquivo baixado e arraste o aplicativo para a pasta Aplicativos.</p>
     </div>
   </section>
 
@@ -437,7 +437,7 @@ HTML_PAGE = """
       </details>
       <details class=\"faq-item\">
         <summary>O link de download muda a cada atualização?<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"m6 9 6 6 6-6\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></summary>
-        <div class=\"faq-body\">Não. O link é fixo e sempre aponta pro build mais recente — cada novo push já deixa o download atualizado, sem precisar avisar ninguém.</div>
+        <div class=\"faq-body\">Não. O link é fixo e sempre aponta pro build mais recente — quando uma nova versão fica pronta, ela passa a estar disponível nos mesmos botões.</div>
       </details>
       <details class=\"faq-item\">
         <summary>Beatport e Bandcamp têm link cruzado entre si?<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"m6 9 6 6 6-6\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></summary>
