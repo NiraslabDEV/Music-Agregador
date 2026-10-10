@@ -104,3 +104,24 @@ de compartilhar alguma pasta pra não ser tratado como leecher.
 - Nenhum "botão de comprar" de verdade — os links levam pro site oficial pra
   você fechar a compra lá. Não haveria como automatizar isso sem violar os
   termos de uso das lojas.
+
+## Busca por produtor (app desktop)
+
+Selecione **Produtor** no tipo de busca e digite o nome artístico completo.
+O app reúne faixas creditadas ao nome no Beatport e no Bandcamp, incluindo
+colaborações e faixas de até seis álbuns encontrados no Bandcamp. Use o filtro
+de texto e a seleção de fonte para explorar a lista; prévias e downloads
+continuam disponíveis nos cards.
+
+O filtro exige o crédito completo do artista, não uma menção no título.
+Identificadores distintos com o mesmo nome no Beatport são tratados como
+ambiguidade e omitidos. Isso reduz resultados incorretos, mas nomes homônimos
+no Bandcamp ainda exigem conferir a página do artista. A lista é uma seleção
+dos resultados públicos, não uma discografia completa.
+
+O Soulseek faz uma busca pelo produtor e associa arquivos com artista e título
+correspondentes no nome do arquivo, preservando o nome da versão/remix.
+Arquivos sem essa evidência são omitidos. Esses nomes são fornecidos por usuários:
+a associação não certifica autoria ou conteúdo do áudio. É necessário estar
+conectado ao Soulseek. A busca por produtor está no programa desktop; a página
+web continua oferecendo a busca simples das lojas e o download do programa.

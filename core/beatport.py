@@ -46,6 +46,7 @@ class BeatportTrack:
     title: str
     mix_name: str = ""
     artists: list[str] = field(default_factory=list)
+    artist_ids: list[int] = field(default_factory=list)
     label: str = ""
     genre: str = ""
     bpm: int = 0
@@ -69,6 +70,8 @@ class BeatportTrack:
     @property
     def url(self) -> str:
         """Não há slug/URL direta no payload de busca — linka pra própria busca."""
+        if self.track_id:
+            return TRACK_URL.format(track_id=self.track_id)
         term = self.query or f"{self.artist_label} {self.full_title}"
         return f"https://www.beatport.com/search?q={requests.utils.quote(term)}"
 
@@ -139,6 +142,7 @@ def _track_from_json(item: dict, query: str) -> Optional[BeatportTrack]:
             title=item.get("track_name") or "(sem título)",
             mix_name=item.get("mix_name") or "",
             artists=artists,
+            artist_ids=[int(a["artist_id"]) for a in (item.get("artists") or []) if a.get("artist_id")],
             label=label.get("label_name", ""),
             genre=", ".join(g.get("genre_name", "") for g in genres if g.get("genre_name")),
             bpm=int(item.get("bpm") or 0),

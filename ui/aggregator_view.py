@@ -14,6 +14,7 @@ from typing import Callable, Optional
 import flet as ft
 
 from core import bandcamp, beatport, youtube
+from core.producer import search_producer
 from core.aggregator import Aggregator, TrackResult
 from core.ai_providers import PROVIDERS, AISettings
 from core.soulseek import Candidate, DownloadJob, dedupe_by_file
@@ -266,6 +267,13 @@ class AggregatorView:
                      "tracklist com horário e gravadora que a gente limpa sozinho",
             multiline=True, min_lines=1, max_lines=8, expand=True, **field_style,
         )
+        self.search_mode = ft.Dropdown(
+            label="Tipo de busca", value="tracks", width=180,
+            options=[ft.dropdown.Option("tracks", "Faixas / tracklist"),
+                     ft.dropdown.Option("producer", "Produtor")],
+            on_change=lambda e: self._change_search_mode(),
+        )
+        self.producer_notice = ft.Text("", size=12, color=MUTED, visible=False)
         self.window_dd = ft.Dropdown(
             label="Coleta Soulseek", width=150, height=56, value="10",
             border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC", border_color="transparent",
@@ -284,6 +292,19 @@ class AggregatorView:
                                               bgcolor=PRIMARY_SOFT, visible=False,
                                               border_radius=4)
 
+        self.result_filter = ft.TextField(
+            label="Filtrar faixas da lista", prefix_icon=ft.icons.FILTER_LIST,
+            on_change=lambda e: self._render_results(), expand=True,
+            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC",
+        )
+        self.source_filter = ft.Dropdown(
+            label="Fonte disponível", value="all", width=190,
+            options=[ft.dropdown.Option("all", "Todas as fontes"),
+                     ft.dropdown.Option("beatport", "Beatport"),
+                     ft.dropdown.Option("bandcamp", "Bandcamp"),
+                     ft.dropdown.Option("soulseek", "Soulseek")],
+            on_change=lambda e: self._render_results(),
+        )
         self.results_count = ft.Text("", size=12, color=MUTED)
         self.results_list = ft.ListView(expand=True, spacing=12, auto_scroll=False)
 
@@ -609,9 +630,11 @@ class AggregatorView:
                              alignment=ft.MainAxisAlignment.END)
 
         search_card = card(
-            section_title(ft.icons.SEARCH, "Buscar faixa",
+            section_title(ft.icons.SEARCH, "Descobrir músicas",
                           "Mostra onde comprar (Beatport, Bandcamp) e a melhor opção grátis "
                           "no Soulseek, lado a lado.", color=PRIMARY),
+            self.search_mode,
+            self.producer_notice,
             ft.Row([self.query_field, self.window_dd, self.search_btn, self.ai_settings_btn],
                   spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             self.search_progress,
@@ -625,6 +648,7 @@ class AggregatorView:
         results_card = card(
             ft.Row([section_title(ft.icons.ALBUM, "Resultados"),
                    ft.Container(expand=True), self.results_count]),
+            ft.Row([self.result_filter, self.source_filter], spacing=10),
             ft.Divider(height=1, color="#EEEDF8"),
             ft.Container(content=self.results_list, height=440),
         )
@@ -736,8 +760,60 @@ class AggregatorView:
 
     # ================= busca =================
 
+    def _change_search_mode(self) -> None:
+        producer = self.search_mode.value == "producer"
+        self.query_field.label = "Nome artístico do produtor" if producer else "Faixa ou tracklist"
+        self.query_field.hint_text = "Ex.: Claudio PRC" if producer else "Artista - Faixa, ou cole um tracklist"
+        self.query_field.max_lines = 1 if producer else 8
+        self.producer_notice.visible = producer
+        self.producer_notice.value = "Créditos das lojas filtrados pelo nome exato. Soulseek: correspondências por nome de arquivo, sem autenticação do áudio."
+        self._safe_update()
+
+    def _start_producer_search(self) -> None:
+        name = (self.query_field.value or "").strip()
+        if not name:
+            self._snack("Digite o nome artístico do produtor.", ft.colors.ORANGE_700)
+            return
+        if self.searching["value"]:
+            return
+        self._save_from_fields()
+        self.searching["value"] = True
+        self.search_btn.disabled = True
+        self.search_mode.disabled = True
+        self.search_progress.visible = True
+        self.search_progress.value = None
+        self.result_groups = {}
+        self.producer_notice.value = f"Procurando faixas creditadas a {name}…"
+        self._render_results()
+
+        def update(result):
+            self.result_groups = dict(result.tracks)
+            self.producer_notice.value = (f"{len(result.tracks)} faixa(s) com crédito correspondente. "
+                "Soulseek: correspondência de nomes, sem autenticação do áudio. "
+                + " ".join(result.warnings))
+            self._render_results()
+
+        def worker():
+            try:
+                search_producer(name, self.engine, float(self.window_dd.value or 10), update)
+            except Exception as ex:
+                self.producer_notice.value = f"Não foi possível concluir: {ex}"
+                self.log(f"Busca por produtor: {ex}")
+            finally:
+                self.searching["value"] = False
+                self.search_btn.disabled = False
+                self.search_mode.disabled = False
+                self.search_progress.visible = False
+                self._render_results()
+        threading.Thread(target=worker, daemon=True).start()
+
     def _start_search(self) -> None:
+        if self.search_mode.value == "producer":
+            self._start_producer_search()
+            return
         raw = self.query_field.value or ""
+        if self.searching["value"]:
+            return
         queries = parse_tracklist_to_queries(raw, ai_settings=self.ai_settings, log=self.log)
         if not queries:
             self._snack("Digite ao menos uma faixa.", ft.colors.ORANGE_700)
@@ -791,11 +867,16 @@ class AggregatorView:
                 self._safe_update()
                 return
 
-            for query, result in groups:
+            filtered = [(q, r) for q, r in groups
+                        if (self.result_filter.value or "").casefold() in q.casefold()
+                        and (self.source_filter.value == "all" or bool(getattr(r, self.source_filter.value or "soulseek", [])))]
+            for query, result in filtered:
                 self.results_list.controls.append(self._track_card(query, result))
+            if not filtered:
+                self.results_list.controls.append(ft.Text("Nenhuma faixa corresponde aos filtros.", color=MUTED))
 
             prontos = sum(1 for _, r in groups if r.done)
-            self.results_count.value = f"{prontos}/{len(groups)} pronto(s)"
+            self.results_count.value = f"{len(filtered)} faixa(s) · {prontos}/{len(groups)} concluída(s)"
             self._safe_update()
 
     def _empty_state(self) -> ft.Container:
@@ -806,7 +887,7 @@ class AggregatorView:
                     width=72, height=72, border_radius=36, bgcolor=PRIMARY_SOFT,
                     alignment=ft.alignment.center,
                 ),
-                ft.Text("Busque uma faixa pra começar", size=15, weight=ft.FontWeight.BOLD,
+                ft.Text("Busque uma faixa ou um produtor", size=15, weight=ft.FontWeight.BOLD,
                        color=INK),
                 ft.Text("Cole o nome de uma música ou uma lista separada por vírgula.",
                        size=12, color=MUTED),
