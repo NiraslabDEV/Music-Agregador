@@ -7,6 +7,7 @@ hover (leve elevação + zoom) pra dar sensação de interatividade num app que,
 por natureza, é basicamente uma lista de resultados.
 """
 
+import json
 import threading
 import time
 from typing import Callable, Optional
@@ -17,7 +18,7 @@ from core import bandcamp, beatport, youtube
 from core.producer import search_producer
 from core.aggregator import Aggregator, TrackResult
 from core.ai_providers import PROVIDERS, AISettings
-from core.soulseek import Candidate, DownloadJob, dedupe_by_file
+from core.soulseek import Candidate, DownloadJob, dedupe_by_file, _data_dir
 from core.tracklist_parser import parse_tracklist_to_queries
 from core.youtube import YouTubeConfig
 
@@ -176,6 +177,7 @@ class AggregatorView:
         self._safe_update()
 
     def shutdown(self) -> None:
+        self._stop_preview()
         try:
             self.aggregator.shutdown()
         except Exception:
@@ -224,6 +226,30 @@ class AggregatorView:
         # primeira prévia (não agora): o controle Audio do Flet exige um `src`
         # não-vazio já no primeiro `page.update()`, e ainda não temos URL nenhuma.
         self.audio_player: Optional[ft.Audio] = None
+        self._audio_lock = threading.RLock()
+        self._preview_generation = 0
+        self._audio_duration = 0
+        self._audio_position = 0
+        self._audio_volume = 0.20
+        try:
+            saved = json.loads((_data_dir() / "player.json").read_text(encoding="utf-8"))
+            value = float(saved.get("volume", 0.20))
+            if 0 <= value <= 1:
+                self._audio_volume = value
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        self._unmuted_volume = self._audio_volume or 0.20
+        self.volume_label = ft.Text(f"{round(self._audio_volume * 100)}%", size=11, color=ft.colors.WHITE)
+        self.volume_slider = ft.Slider(
+            min=0, max=100, value=self._audio_volume * 100, divisions=100,
+            label="{value}%", width=130, active_color=ft.colors.WHITE,
+            on_change=self._change_volume, on_change_end=lambda e: self._save_volume(),
+        )
+        self.mute_btn = ft.IconButton(
+            ft.icons.VOLUME_OFF if self._audio_volume == 0 else ft.icons.VOLUME_UP,
+            icon_color=ft.colors.WHITE, tooltip="Ativar som" if self._audio_volume == 0 else "Silenciar",
+            on_click=lambda e: self._toggle_mute(),
+        )
 
         # Barra "tocando agora", fixa embaixo da área rolável (não some ao
         # rolar a lista de resultados) — mostra o que está tocando e dá
@@ -253,13 +279,16 @@ class AggregatorView:
                 ft.Column([self.now_playing_title, self.now_playing_subtitle],
                          spacing=0, tight=True, expand=True),
                 self.now_playing_time,
+                self.mute_btn,
+                self.volume_slider,
+                self.volume_label,
                 self.now_playing_toggle_btn,
                 self.now_playing_stop_btn,
             ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         )
         self._now_playing_call: Optional[Callable[[], None]] = None
         self._now_playing_meta: tuple[str, str] = ("", "")
-        self._start_now_playing_ticker()
+
 
         self.query_field = ft.TextField(
             label="Faixa, lista separada por vírgula, ou um tracklist colado inteiro",
@@ -395,102 +424,173 @@ class AggregatorView:
 
     # ================= prévia de áudio =================
 
+    def _save_volume(self) -> None:
+        try:
+            (_data_dir() / "player.json").write_text(
+                json.dumps({"volume": self._audio_volume}), encoding="utf-8")
+        except OSError as ex:
+            self.log(f"Não foi possível salvar o volume: {ex}")
+
+    def _apply_volume(self, value: float) -> None:
+        with self._audio_lock:
+            self._audio_volume = max(0.0, min(1.0, value))
+            if self._audio_volume > 0:
+                self._unmuted_volume = self._audio_volume
+            self.volume_slider.value = self._audio_volume * 100
+            self.volume_label.value = f"{round(self._audio_volume * 100)}%"
+            self.mute_btn.icon = ft.icons.VOLUME_OFF if self._audio_volume == 0 else ft.icons.VOLUME_UP
+            self.mute_btn.tooltip = "Ativar som" if self._audio_volume == 0 else "Silenciar"
+            if self.audio_player is not None:
+                self.audio_player.volume = self._audio_volume
+            self._safe_update()
+
+    def _change_volume(self, e) -> None:
+        try:
+            self._apply_volume(float(e.control.value) / 100)
+        except (TypeError, ValueError):
+            return
+
+    def _toggle_mute(self) -> None:
+        self._apply_volume(self._unmuted_volume if self._audio_volume == 0 else 0)
+        self._save_volume()
+
+    def _dispose_audio(self) -> None:
+        player = self.audio_player
+        self.audio_player = None  # Ignore delayed events from the old control.
+        if player is not None:
+            try:
+                player.pause()
+            except Exception as ex:
+                self.log(f"Erro ao pausar prévia anterior: {ex}")
+            try:
+                player.release()
+            except Exception as ex:
+                self.log(f"Erro ao liberar prévia: {ex}")
+            if player in self.page.overlay:
+                self.page.overlay.remove(player)
+
     def _on_audio_state(self, e) -> None:
-        if e.data in ("completed", "stopped"):
+        with self._audio_lock:
+            if e.control is not self.audio_player:
+                return
+            if e.data == "completed":
+                self._playing_key = None
+                self._paused_key = None
+                self._now_playing_call = None
+                self._update_now_playing_bar()
+                self._render_results()
+
+    def _on_audio_time(self, e, duration=False) -> None:
+        with self._audio_lock:
+            if e.control is not self.audio_player:
+                return
+            try:
+                value = max(0, int(e.data))
+            except (TypeError, ValueError):
+                return
+            if duration:
+                self._audio_duration = value
+            else:
+                self._audio_position = value
+            self.now_playing_time.value = f"{self._fmt_ms(self._audio_position)} / {self._fmt_ms(self._audio_duration)}"
+            self._safe_update()
+
+    def _toggle_preview(self, key: str, fetch_fn, title: str = "", subtitle: str = "") -> None:
+        with self._audio_lock:
+            if self._playing_key == key and self.audio_player is not None:
+                try:
+                    self.audio_player.pause()
+                except Exception as ex:
+                    self.log(f"Erro ao pausar prévia: {ex}")
+                    self._snack("Não foi possível pausar a prévia.", ft.colors.ORANGE_700)
+                    return
+                self._playing_key = None
+                self._paused_key = key
+                self._update_now_playing_bar()
+                self._render_results()
+                return
+            if self._paused_key == key and self.audio_player is not None:
+                try:
+                    self.audio_player.resume()
+                except Exception as ex:
+                    self.log(f"Erro ao retomar prévia: {ex}")
+                    return
+                self._paused_key = None
+                self._playing_key = key
+                self._update_now_playing_bar()
+                self._render_results()
+                return
+            self._preview_generation += 1
+            generation = self._preview_generation
+            self._dispose_audio()
+            self._paused_key = None
+            self._playing_key = f"loading:{key}"
+            self._audio_duration = self._audio_position = 0
+            self.now_playing_time.value = "Carregando…"
+            self._now_playing_call = lambda: self._toggle_preview(key, fetch_fn, title, subtitle)
+            self._now_playing_meta = (title, subtitle)
+            self._update_now_playing_bar()
+            self._render_results()
+
+        def worker():
+            try:
+                url = fetch_fn()
+            except Exception as ex:
+                self.log(f"Erro ao buscar prévia: {ex}")
+                url = None
+            with self._audio_lock:
+                if generation != self._preview_generation:
+                    return
+                if not url:
+                    self._playing_key = None
+                    self._now_playing_call = None
+                    self._update_now_playing_bar()
+                    self._snack("Prévia indisponível. Tente ouvir na página da loja.", ft.colors.ORANGE_700)
+                    self._render_results()
+                    return
+                def loaded(e):
+                    with self._audio_lock:
+                        if generation != self._preview_generation or e.control is not self.audio_player:
+                            return
+                        try:
+                            self.audio_player.play()
+                        except Exception as ex:
+                            self.log(f"Erro ao iniciar prévia: {ex}")
+                            self._stop_preview()
+                            self._snack("Não foi possível reproduzir a prévia.", ft.colors.ORANGE_700)
+                            return
+                        self._playing_key = key
+                        self.now_playing_time.value = "0:00"
+                        self._update_now_playing_bar()
+                        self._render_results()
+                self.audio_player = ft.Audio(
+                    src=url, autoplay=False, volume=self._audio_volume,
+                    on_loaded=loaded, on_state_changed=self._on_audio_state,
+                    on_position_changed=self._on_audio_time,
+                    on_duration_changed=lambda e: self._on_audio_time(e, duration=True),
+                )
+                self.page.overlay.append(self.audio_player)
+                # Mount before play(); play is invoked only by on_loaded.
+                self._safe_update()
+
+            def timeout():
+                time.sleep(20)
+                with self._audio_lock:
+                    if generation == self._preview_generation and self._playing_key == f"loading:{key}":
+                        self._stop_preview()
+                        self._snack("A prévia demorou para carregar. Tente novamente ou abra a loja.", ft.colors.ORANGE_700)
+            threading.Thread(target=timeout, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_preview(self) -> None:
+        with self._audio_lock:
+            self._preview_generation += 1
+            self._dispose_audio()
             self._playing_key = None
             self._paused_key = None
             self._now_playing_call = None
             self._update_now_playing_bar()
             self._render_results()
-
-    def _toggle_preview(self, key: str, fetch_fn, title: str = "", subtitle: str = "") -> None:
-        """Toca/pausa/retoma a prévia de uma faixa.
-
-        Três casos: já tocando essa faixa -> pausa no lugar; pausada nessa
-        mesma faixa -> retoma do ponto onde parou; qualquer outro caso ->
-        busca a URL (sob demanda) e começa do zero. `fetch_fn` só é chamado
-        nesse último caso. `title`/`subtitle` só servem pra popular a barra
-        "tocando agora" — não são usados nos dois primeiros casos.
-        """
-        if self._playing_key == key and self.audio_player is not None:
-            try:
-                self.audio_player.pause()
-            except Exception as ex:
-                self.log(f"Erro ao pausar prévia: {ex}")
-            self._playing_key = None
-            self._paused_key = key
-            self._update_now_playing_bar()
-            self._render_results()
-            return
-
-        if self._paused_key == key and self.audio_player is not None:
-            try:
-                self.audio_player.resume()
-            except Exception as ex:
-                self.log(f"Erro ao retomar prévia: {ex}")
-            self._paused_key = None
-            self._playing_key = key
-            self._update_now_playing_bar()
-            self._render_results()
-            return
-
-        self._paused_key = None
-        self._playing_key = f"loading:{key}"
-        self._now_playing_call = lambda: self._toggle_preview(key, fetch_fn, title, subtitle)
-        self._now_playing_meta = (title, subtitle)
-        self._render_results()
-
-        def worker():
-            url = None
-            try:
-                url = fetch_fn()
-            except Exception as ex:
-                self.log(f"Erro ao buscar prévia: {ex}")
-            if not url:
-                self._playing_key = None
-                self._now_playing_call = None
-                self._snack("Prévia não disponível para essa faixa.", ft.colors.ORANGE_700)
-                self._render_results()
-                return
-            if self.audio_player is None:
-                # Só é criado agora, com um `src` de verdade — o controle Audio
-                # do Flet quebra a renderização se for montado com src vazio.
-                self.audio_player = ft.Audio(src=url, autoplay=True,
-                                             on_state_changed=self._on_audio_state)
-                self.page.overlay.append(self.audio_player)
-            else:
-                # Trocar só o `src` às vezes não reinicia o player de verdade
-                # (fica "preso" no estado da prévia anterior) — soltar antes
-                # força o recarregamento limpo.
-                try:
-                    self.audio_player.release()
-                except Exception:
-                    pass
-                self.audio_player.src = url
-                self.audio_player.autoplay = True
-            self._playing_key = key
-            self.log(f"Tocando prévia: {url}")
-            try:
-                self.audio_player.play()
-            except Exception as ex:
-                self.log(f"Erro ao chamar play(): {ex}")
-            self._update_now_playing_bar()
-            self._render_results()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _stop_preview(self) -> None:
-        """Para de vez (diferente de pausar): solta o player e some com a barra."""
-        if self.audio_player is not None:
-            try:
-                self.audio_player.release()
-            except Exception:
-                pass
-        self._playing_key = None
-        self._paused_key = None
-        self._now_playing_call = None
-        self._update_now_playing_bar()
-        self._render_results()
 
     def _now_playing_toggle_click(self) -> None:
         if self._now_playing_call:
@@ -498,7 +598,7 @@ class AggregatorView:
 
     def _update_now_playing_bar(self) -> None:
         active_key = self._playing_key or self._paused_key
-        if not active_key or active_key.startswith("loading:") or not self._now_playing_call:
+        if not active_key or not self._now_playing_call:
             self.now_playing_bar.visible = False
             self._safe_update()
             return
@@ -506,6 +606,7 @@ class AggregatorView:
         title, subtitle = getattr(self, "_now_playing_meta", ("", ""))
         self.now_playing_title.value = title or "Prévia"
         self.now_playing_subtitle.value = subtitle
+        self.now_playing_toggle_btn.disabled = active_key.startswith("loading:")
         is_paused = self._paused_key == active_key
         self.now_playing_toggle_btn.icon = (
             ft.icons.PLAY_CIRCLE_ROUNDED if is_paused else ft.icons.PAUSE_CIRCLE_ROUNDED)
@@ -524,32 +625,6 @@ class AggregatorView:
         m, s = divmod(s, 60)
         return f"{m}:{s:02d}"
 
-    def _start_now_playing_ticker(self) -> None:
-        """Uma única thread de fundo, pra vida toda do app, que atualiza o
-        tempo decorrido da prévia enquanto algo está tocando — evita criar
-        uma thread nova a cada play."""
-
-        def tick():
-            while True:
-                time.sleep(1)
-                if self.audio_player is None or not self._playing_key or \
-                        self._playing_key.startswith("loading:"):
-                    continue
-                try:
-                    pos = self.audio_player.get_current_position(wait_timeout=1.5)
-                    dur = self.audio_player.get_duration(wait_timeout=1.5)
-                except Exception:
-                    continue
-                if pos is None:
-                    continue
-                self.now_playing_time.value = f"{self._fmt_ms(pos)} / {self._fmt_ms(dur)}"
-                try:
-                    self.now_playing_time.update()
-                except Exception:
-                    pass
-
-        threading.Thread(target=tick, daemon=True).start()
-
     def _preview_button(self, key: str, color: str, fetch_fn,
                         title: str = "", subtitle: str = "") -> ft.IconButton:
         loading = self._playing_key == f"loading:{key}"
@@ -558,7 +633,7 @@ class AggregatorView:
         icon = ft.icons.HOURGLASS_TOP_ROUNDED if loading else (
             ft.icons.PAUSE_CIRCLE_ROUNDED if playing else ft.icons.PLAY_CIRCLE_OUTLINE_ROUNDED)
         tooltip = "Pausar prévia" if playing else (
-            "Retomar prévia" if paused else "Ouvir prévia de ~30s")
+            "Retomar prévia" if paused else "Ouvir prévia")
         return ft.IconButton(
             icon, icon_color=color, icon_size=26, disabled=loading,
             tooltip=tooltip,
