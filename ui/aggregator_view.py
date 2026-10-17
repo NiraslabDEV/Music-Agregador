@@ -8,8 +8,10 @@ por natureza, é basicamente uma lista de resultados.
 """
 
 import json
+import os
 import threading
 import time
+import weakref
 from typing import Callable, Optional
 
 import flet as ft
@@ -17,135 +19,58 @@ import flet as ft
 from core import bandcamp, beatport, youtube
 from core.producer import search_producer
 from core.aggregator import Aggregator, TrackResult
+from core.local_media import LocalMediaServer
 from core.ai_providers import PROVIDERS, AISettings
 from core.soulseek import Candidate, DownloadJob, dedupe_by_file, _data_dir
 from core.tracklist_parser import parse_tracklist_to_queries
 from core.youtube import YouTubeConfig
+from ui.dj_tools import LIBRARY_PAGE, STARTUP_ANALYSIS_DELAY, DjToolsMixin
+from ui.theme import (
+    PAGE_BG, SURFACE, SUBTLE, FIELD_BG, BORDER, INK, MUTED, PRIMARY, PRIMARY_SOFT, BRAND,
+    PRIMARY_DARK, BEATPORT_COLOR, BANDCAMP_COLOR, FREE_COLOR, BEATPORT_SOFT, BANDCAMP_SOFT,
+    FREE_SOFT, SOULSEEK_NEUTRAL, RADIUS_LG, RADIUS_MD, RADIUS_SM, HEADER_GRADIENT, _plural,
+    soft_shadow, _relative_time, _open_path, card, section_title, pill, pstyle, outline_style,
+    platform_badge,
+)
 
 SOULSEEK_FORMATS = ("flac", "wav", "mp3")
 
 RENDER_INTERVAL = 0.8
+RECENT_SEARCHES_MAX = 8
+LIBRARY_LIMIT = 300
 
-# ============================== DESIGN TOKENS ==============================
-
-PAGE_BG = "#F3F2FB"          # lavanda bem suave, menos "cinza de sistema"
-INK = "#1E1B33"              # texto principal (quase preto, com tom roxo)
-MUTED = "#6B6684"            # texto secundário
-
-PRIMARY = "#4F46E5"          # indigo-600
-PRIMARY_DARK = "#3730A3"     # indigo-800
-PRIMARY_SOFT = "#EEF0FE"     # tint claro do primary, pra fundos/pills
-
-BEATPORT_COLOR = "#E11D74"   # coral/magenta — remete a dance music sem copiar marca
-BEATPORT_SOFT = "#FDEBF3"
-BANDCAMP_COLOR = "#0F91A8"   # teal
-BANDCAMP_SOFT = "#E6F6F9"
-FREE_COLOR = "#16A34A"       # verde "grátis"
-FREE_SOFT = "#E9F9EF"
-SOULSEEK_NEUTRAL = "#475569" # cor neutra do painel Soulseek (o destaque é o verde do preço)
-
-RADIUS_LG = 18
-RADIUS_MD = 14
-RADIUS_SM = 10
-
-HEADER_GRADIENT = ft.LinearGradient(
-    begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
-    colors=[PRIMARY_DARK, PRIMARY, "#7C3AED"],
-)
+NAV_DISCOVER, NAV_DOWNLOADS, NAV_LIBRARY, NAV_CRATES, NAV_LOG = range(5)
 
 
-def _plural(n: int, singular: str, plural: str = None) -> str:
-    plural = plural or f"{singular}s"
-    return f"{n} {singular}" if n == 1 else f"{n} {plural}"
-
-
-def soft_shadow(blur=18, dy=6, opacity=0.07) -> ft.BoxShadow:
-    return ft.BoxShadow(blur_radius=blur, spread_radius=0,
-                        color=ft.colors.with_opacity(opacity, "#2E1065"),
-                        offset=ft.Offset(0, dy))
-
-
-def card(*controls, expand=False, padding=20) -> ft.Container:
-    return ft.Container(
-        content=ft.Column(list(controls), spacing=10, tight=True),
-        bgcolor=ft.colors.WHITE, border_radius=RADIUS_LG, padding=padding,
-        border=ft.border.all(1, "#EBE9F7"),
-        shadow=soft_shadow(),
-        expand=expand,
-    )
-
-
-def section_title(icon, title, subtitle=None, color=None) -> ft.Column:
-    rows = [ft.Row([
-        ft.Container(
-            content=ft.Icon(icon, color=color or PRIMARY, size=17),
-            width=32, height=32, border_radius=10, alignment=ft.alignment.center,
-            bgcolor=ft.colors.with_opacity(0.10, color or PRIMARY),
-        ),
-        ft.Text(title, size=16, weight=ft.FontWeight.BOLD, color=INK),
-    ], spacing=10)]
-    if subtitle:
-        rows.append(ft.Container(
-            content=ft.Text(subtitle, size=12, color=MUTED), padding=ft.padding.only(left=42),
-        ))
-    return ft.Column(rows, spacing=6, tight=True)
-
-
-def pill(text: str, color: str, soft: str, size=13, icon=None) -> ft.Container:
-    """Badge arredondado (preço, tag de formato, status) — a peça central do design."""
-    content = [ft.Text(text, size=size, weight=ft.FontWeight.BOLD, color=color)]
-    if icon:
-        content.insert(0, ft.Icon(icon, size=size + 2, color=color))
-    return ft.Container(
-        content=ft.Row(content, spacing=4, tight=True),
-        bgcolor=soft, padding=ft.padding.symmetric(horizontal=10, vertical=5),
-        border_radius=20,
-    )
-
-
-def pstyle(bg, fg=None) -> ft.ButtonStyle:
-    return ft.ButtonStyle(
-        bgcolor=bg, color=fg or ft.colors.WHITE,
-        shape=ft.RoundedRectangleBorder(radius=RADIUS_SM),
-        padding=ft.padding.symmetric(horizontal=20, vertical=12),
-        elevation=0,
-    )
-
-
-def outline_style(color) -> ft.ButtonStyle:
-    return ft.ButtonStyle(
-        color=color, side=ft.BorderSide(1.4, color),
-        shape=ft.RoundedRectangleBorder(radius=RADIUS_SM),
-        padding=ft.padding.symmetric(horizontal=14, vertical=10),
-    )
-
-
-def platform_badge(icon, color) -> ft.Container:
-    return ft.Container(
-        content=ft.Icon(icon, size=15, color=ft.colors.WHITE),
-        width=26, height=26, border_radius=8, bgcolor=color, alignment=ft.alignment.center,
-    )
-
-
-class AggregatorView:
+class AggregatorView(DjToolsMixin):
     def __init__(self, page: ft.Page):
         self.page = page
-        self.page.bgcolor = PAGE_BG
         self.aggregator = Aggregator(log_callback=self.log)
         self.engine = self.aggregator.soulseek
         self.config = self.engine.config
+        self.media = LocalMediaServer()
         self.ai_settings = AISettings.load()
         self.youtube_config = YouTubeConfig.load()
         self._playing_key: Optional[str] = None
         self._paused_key: Optional[str] = None
+        # key -> botões de play daquela faixa em qualquer lista (resultados,
+        # biblioteca, crates, sugestões). Fraco: some quando a lista é refeita.
+        self._play_buttons: dict[str, weakref.WeakSet] = {}
 
         self.result_groups: dict[str, TrackResult] = {}
+        self.recent_searches: list[dict] = self._load_recent_searches()
+        self._downloaded: set[tuple[str, str]] = set()
+        self._library: list[dict] = []
         self.searching = {"value": False}
         self._last_render = 0.0
         self._render_lock = threading.Lock()
 
+        self._dj_init()
         self._build_controls()
         self._main_layout = self._build_layout()
+        # Só carrega a lista e enfileira a análise; desenhar fica pra quando a
+        # aba Biblioteca abrir (com 100+ faixas, desenhar na abertura atrasava tudo).
+        self._reload_library(analysis_delay=STARTUP_ANALYSIS_DELAY)
         self._login_screen = self._build_login_screen()
         # Sempre entra pela tela de login — mesmo com credenciais salvas, a
         # pessoa dá o clique em "Conectar" (mas os campos já vêm preenchidos).
@@ -158,7 +83,7 @@ class AggregatorView:
 
     def log(self, msg: str) -> None:
         self.log_area.controls.append(
-            ft.Text(f"›  {msg}", size=12, color="#3A3560", selectable=True,
+            ft.Text(f"›  {msg}", size=12, color=INK, selectable=True,
                     font_family="Consolas")
         )
         if len(self.log_area.controls) > 300:
@@ -171,13 +96,27 @@ class AggregatorView:
         except Exception:
             pass
 
-    def _snack(self, msg: str, color=None) -> None:
-        self.page.snack_bar = ft.SnackBar(ft.Text(msg), bgcolor=color)
+    def _update_controls(self, *controls) -> None:
+        """Atualiza só esses controles. page.update() compara a árvore inteira
+        (milhares de controles com a biblioteca cheia), então tudo que acontece
+        várias vezes por segundo — posição da música, play/pause, progresso da
+        análise — passa por aqui. Controle fora da tela é ignorado."""
+        for control in controls:
+            try:
+                control.update()
+            except Exception:
+                pass
+
+    def _snack(self, msg: str, color=None, action: str = None, on_action=None) -> None:
+        self.page.snack_bar = ft.SnackBar(ft.Text(msg), bgcolor=color, action=action,
+                                          action_color=ft.colors.WHITE if color else None,
+                                          on_action=on_action)
         self.page.snack_bar.open = True
         self._safe_update()
 
     def shutdown(self) -> None:
         self._stop_preview()
+        self.media.shutdown()
         try:
             self.aggregator.shutdown()
         except Exception:
@@ -188,7 +127,7 @@ class AggregatorView:
     def _build_controls(self) -> None:
         c = self.config
         field_style = dict(
-            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC",
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG,
             border_color="transparent", focused_border_color=PRIMARY,
         )
         self.user_field = ft.TextField(label="Usuário do Soulseek", value=c.username,
@@ -206,7 +145,7 @@ class AggregatorView:
         self.status_pill = ft.Container(
             content=ft.Row([self.status_dot, self.status_text], spacing=8,
                            tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            bgcolor="#F1F0F9", padding=ft.padding.symmetric(horizontal=12, vertical=8),
+            bgcolor=FIELD_BG, padding=ft.padding.symmetric(horizontal=12, vertical=8),
             border_radius=20, tooltip="Gerenciar conta",
             on_click=lambda e: self._show_login_screen(),
         )
@@ -286,6 +225,18 @@ class AggregatorView:
                 self.now_playing_stop_btn,
             ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         )
+        self._seeking = False
+        self.seek_slider = ft.Slider(
+            min=0, max=1, value=0, expand=True, height=20, disabled=True,
+            active_color=ft.colors.WHITE,
+            inactive_color=ft.colors.with_opacity(0.25, ft.colors.WHITE),
+            thumb_color=ft.colors.WHITE,
+            on_change_start=lambda e: setattr(self, "_seeking", True),
+            on_change_end=self._seek,
+        )
+        self.now_playing_bar.content = ft.Column(
+            [self.now_playing_bar.content, self.seek_slider], spacing=0, tight=True)
+        self.now_playing_bar.padding = ft.padding.only(left=20, right=20, top=10, bottom=4)
         self._now_playing_call: Optional[Callable[[], None]] = None
         self._now_playing_meta: tuple[str, str] = ("", "")
 
@@ -305,7 +256,7 @@ class AggregatorView:
         self.producer_notice = ft.Text("", size=12, color=MUTED, visible=False)
         self.window_dd = ft.Dropdown(
             label="Coleta Soulseek", width=150, height=56, value="10",
-            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC", border_color="transparent",
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG, border_color="transparent",
             options=[ft.dropdown.Option(v, f"{v}s") for v in ("6", "10", "20")],
         )
         self.search_btn = ft.ElevatedButton("Buscar", icon=ft.icons.SEARCH, height=56,
@@ -324,7 +275,7 @@ class AggregatorView:
         self.result_filter = ft.TextField(
             label="Filtrar faixas da lista", prefix_icon=ft.icons.FILTER_LIST,
             on_change=lambda e: self._render_results(), expand=True,
-            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC",
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG,
         )
         self.source_filter = ft.Dropdown(
             label="Fonte disponível", value="all", width=190,
@@ -340,16 +291,52 @@ class AggregatorView:
         self.jobs_list = ft.ListView(expand=True, spacing=6, auto_scroll=False)
         self.jobs_count = ft.Text("Nenhum download na fila", size=12, color=MUTED)
 
-        self.log_area = ft.ListView(expand=True, spacing=3, auto_scroll=True, height=120)
+        self.log_area = ft.ListView(expand=True, spacing=3, auto_scroll=True)
+
+        self.recent_row = ft.Row(spacing=6, wrap=True, run_spacing=6)
+        self._render_recent_searches()
+
+        self.library_filter = ft.TextField(
+            label="Procurar na biblioteca", prefix_icon=ft.icons.SEARCH,
+            on_change=lambda e: self._reset_library_paging(), expand=True,
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG,
+            border_color="transparent", focused_border_color=PRIMARY,
+        )
+        self.library_count = ft.Text("", size=12, color=MUTED)
+        self.library_list = ft.ListView(expand=True, spacing=8, auto_scroll=False)
+        self._dj_build_controls()
+
+        self.nav_downloads = ft.NavigationRailDestination(
+            icon=ft.icons.DOWNLOADING_OUTLINED, selected_icon=ft.icons.DOWNLOADING,
+            label="Downloads")
+        self.nav = ft.NavigationRail(
+            selected_index=NAV_DISCOVER, label_type=ft.NavigationRailLabelType.ALL,
+            min_width=92, bgcolor=SURFACE, indicator_color=PRIMARY_SOFT,
+            group_alignment=-0.9,
+            destinations=[
+                ft.NavigationRailDestination(icon=ft.icons.SEARCH_OUTLINED,
+                                             selected_icon=ft.icons.SEARCH, label="Descobrir"),
+                self.nav_downloads,
+                ft.NavigationRailDestination(icon=ft.icons.LIBRARY_MUSIC_OUTLINED,
+                                             selected_icon=ft.icons.LIBRARY_MUSIC,
+                                             label="Biblioteca"),
+                ft.NavigationRailDestination(icon=ft.icons.QUEUE_MUSIC_OUTLINED,
+                                             selected_icon=ft.icons.QUEUE_MUSIC_ROUNDED,
+                                             label="Crates"),
+                ft.NavigationRailDestination(icon=ft.icons.TERMINAL_OUTLINED,
+                                             selected_icon=ft.icons.TERMINAL, label="Log"),
+            ],
+            on_change=lambda e: self._go_to(e.control.selected_index),
+        )
 
     def _build_ai_settings_dialog(self) -> None:
         field_style = dict(
-            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC",
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG,
             border_color="transparent", focused_border_color=PRIMARY, height=50,
         )
         self.ai_provider_dd = ft.Dropdown(
             label="Provedor padrão", value=self.ai_settings.active_provider,
-            border_radius=RADIUS_SM, filled=True, bgcolor="#F7F7FC", border_color="transparent",
+            border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG, border_color="transparent",
             options=[ft.dropdown.Option(p.id, p.label) for p in PROVIDERS.values()],
         )
         self.ai_key_fields: dict[str, ft.TextField] = {}
@@ -386,7 +373,7 @@ class AggregatorView:
                            "obrigatório.", size=12, color=MUTED),
                     self.ai_provider_dd,
                     *key_rows,
-                    ft.Divider(height=1, color="#EEEDF8"),
+                    ft.Divider(height=1, color=BORDER),
                     ft.Column([
                         self.youtube_key_field,
                         ft.Text("Chave grátis em console.cloud.google.com "
@@ -478,7 +465,7 @@ class AggregatorView:
                 self._paused_key = None
                 self._now_playing_call = None
                 self._update_now_playing_bar()
-                self._render_results()
+                self._refresh_play_icons()
 
     def _on_audio_time(self, e, duration=False) -> None:
         with self._audio_lock:
@@ -490,10 +477,17 @@ class AggregatorView:
                 return
             if duration:
                 self._audio_duration = value
+                self.seek_slider.max = max(1, value)
+                self.seek_slider.disabled = value <= 0
             else:
                 self._audio_position = value
-            self.now_playing_time.value = f"{self._fmt_ms(self._audio_position)} / {self._fmt_ms(self._audio_duration)}"
-            self._safe_update()
+            text = f"{self._fmt_ms(self._audio_position)} / {self._fmt_ms(self._audio_duration)}"
+            if text == self.now_playing_time.value and not duration:
+                return  # o evento chega várias vezes por segundo; a tela só muda a cada 1s
+            if not self._seeking:
+                self.seek_slider.value = min(self._audio_position, self.seek_slider.max)
+            self.now_playing_time.value = text
+            self._update_controls(self.now_playing_bar)
 
     def _toggle_preview(self, key: str, fetch_fn, title: str = "", subtitle: str = "") -> None:
         with self._audio_lock:
@@ -507,7 +501,7 @@ class AggregatorView:
                 self._playing_key = None
                 self._paused_key = key
                 self._update_now_playing_bar()
-                self._render_results()
+                self._refresh_play_icons()
                 return
             if self._paused_key == key and self.audio_player is not None:
                 try:
@@ -518,7 +512,7 @@ class AggregatorView:
                 self._paused_key = None
                 self._playing_key = key
                 self._update_now_playing_bar()
-                self._render_results()
+                self._refresh_play_icons()
                 return
             self._preview_generation += 1
             generation = self._preview_generation
@@ -526,11 +520,13 @@ class AggregatorView:
             self._paused_key = None
             self._playing_key = f"loading:{key}"
             self._audio_duration = self._audio_position = 0
+            self.seek_slider.value, self.seek_slider.max = 0, 1
+            self.seek_slider.disabled = True
             self.now_playing_time.value = "Carregando…"
             self._now_playing_call = lambda: self._toggle_preview(key, fetch_fn, title, subtitle)
             self._now_playing_meta = (title, subtitle)
             self._update_now_playing_bar()
-            self._render_results()
+            self._refresh_play_icons()
 
         def worker():
             try:
@@ -546,7 +542,7 @@ class AggregatorView:
                     self._now_playing_call = None
                     self._update_now_playing_bar()
                     self._snack("Prévia indisponível. Tente ouvir na página da loja.", ft.colors.ORANGE_700)
-                    self._render_results()
+                    self._refresh_play_icons()
                     return
                 def loaded(e):
                     with self._audio_lock:
@@ -562,7 +558,7 @@ class AggregatorView:
                         self._playing_key = key
                         self.now_playing_time.value = "0:00"
                         self._update_now_playing_bar()
-                        self._render_results()
+                        self._refresh_play_icons()
                 self.audio_player = ft.Audio(
                     src=url, autoplay=False, volume=self._audio_volume,
                     on_loaded=loaded, on_state_changed=self._on_audio_state,
@@ -590,7 +586,43 @@ class AggregatorView:
             self._paused_key = None
             self._now_playing_call = None
             self._update_now_playing_bar()
-            self._render_results()
+            self._refresh_play_icons()
+
+    def _seek(self, e) -> None:
+        self._seeking = False
+        with self._audio_lock:
+            if self.audio_player is None or not self._audio_duration:
+                return
+            try:
+                position = int(float(e.control.value))
+                self.audio_player.seek(position)
+            except Exception as ex:
+                self.log(f"Erro ao avançar/voltar a música: {ex}")
+                return
+            self._audio_position = position
+
+    def _play_button_state(self, key: str, play_icon: str, idle_tooltip: str):
+        loading = self._playing_key == f"loading:{key}"
+        playing = self._playing_key == key
+        paused = self._paused_key == key
+        icon = ft.icons.HOURGLASS_TOP_ROUNDED if loading else (
+            ft.icons.PAUSE_CIRCLE_ROUNDED if playing else play_icon)
+        tooltip = "Pausar" if playing else ("Retomar" if paused else idle_tooltip)
+        return icon, tooltip, loading
+
+    def _refresh_play_icons(self) -> None:
+        """Troca só o ícone dos botões que mudaram — sem refazer nenhuma lista."""
+        changed = []
+        for key, buttons in list(self._play_buttons.items()):
+            for btn in list(buttons):
+                icon, tooltip, loading = self._play_button_state(
+                    key, btn.data["play_icon"], btn.data["idle_tooltip"])
+                if (btn.icon, btn.tooltip, btn.disabled) != (icon, tooltip, loading):
+                    btn.icon, btn.tooltip, btn.disabled = icon, tooltip, loading
+                    changed.append(btn)
+            if not buttons:
+                del self._play_buttons[key]
+        self._update_controls(*changed)
 
     def _now_playing_toggle_click(self) -> None:
         if self._now_playing_call:
@@ -600,7 +632,7 @@ class AggregatorView:
         active_key = self._playing_key or self._paused_key
         if not active_key or not self._now_playing_call:
             self.now_playing_bar.visible = False
-            self._safe_update()
+            self._update_controls(self.now_playing_bar)
             return
 
         title, subtitle = getattr(self, "_now_playing_meta", ("", ""))
@@ -615,7 +647,7 @@ class AggregatorView:
             self.now_playing_time.value = f"{self.now_playing_time.value.split(' / ')[0]} · pausado" \
                 if self.now_playing_time.value else "pausado"
         self.now_playing_bar.visible = True
-        self._safe_update()
+        self._update_controls(self.now_playing_bar)
 
     @staticmethod
     def _fmt_ms(ms: Optional[int]) -> str:
@@ -626,19 +658,17 @@ class AggregatorView:
         return f"{m}:{s:02d}"
 
     def _preview_button(self, key: str, color: str, fetch_fn,
-                        title: str = "", subtitle: str = "") -> ft.IconButton:
-        loading = self._playing_key == f"loading:{key}"
-        playing = self._playing_key == key
-        paused = self._paused_key == key
-        icon = ft.icons.HOURGLASS_TOP_ROUNDED if loading else (
-            ft.icons.PAUSE_CIRCLE_ROUNDED if playing else ft.icons.PLAY_CIRCLE_OUTLINE_ROUNDED)
-        tooltip = "Pausar prévia" if playing else (
-            "Retomar prévia" if paused else "Ouvir prévia")
-        return ft.IconButton(
-            icon, icon_color=color, icon_size=26, disabled=loading,
-            tooltip=tooltip,
+                        title: str = "", subtitle: str = "", size: int = 26,
+                        play_icon=ft.icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+                        idle_tooltip: str = "Ouvir prévia") -> ft.IconButton:
+        icon, tooltip, loading = self._play_button_state(key, play_icon, idle_tooltip)
+        btn = ft.IconButton(
+            icon, icon_color=color, icon_size=size, disabled=loading,
+            tooltip=tooltip, data={"play_icon": play_icon, "idle_tooltip": idle_tooltip},
             on_click=lambda e: self._toggle_preview(key, fetch_fn, title, subtitle),
         )
+        self._play_buttons.setdefault(key, weakref.WeakSet()).add(btn)
+        return btn
 
     def _open_youtube_listen(self, query: str) -> None:
         api_key = self.youtube_config.api_key
@@ -684,7 +714,7 @@ class AggregatorView:
                     "site nenhum.",
                     size=11, color=MUTED, text_align=ft.TextAlign.CENTER,
                 ),
-                ft.Divider(height=1, color="#EEEDF8"),
+                ft.Divider(height=1, color=BORDER),
                 ft.Row([
                     ft.OutlinedButton("Pasta de downloads", icon=ft.icons.FOLDER_OPEN,
                                      style=outline_style(MUTED),
@@ -695,8 +725,8 @@ class AggregatorView:
                 self.share_check,
             ], spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                width=340),
-            bgcolor=ft.colors.WHITE, border_radius=RADIUS_LG, padding=32,
-            border=ft.border.all(1, "#EBE9F7"), shadow=soft_shadow(blur=30, dy=10, opacity=0.10),
+            bgcolor=SURFACE, border_radius=RADIUS_LG, padding=32,
+            border=ft.border.all(1, BORDER), shadow=soft_shadow(blur=30, dy=10, opacity=0.10),
         )
         return ft.Container(content=login_card, alignment=ft.alignment.center, expand=True)
 
@@ -713,43 +743,287 @@ class AggregatorView:
             ft.Row([self.query_field, self.window_dd, self.search_btn, self.ai_settings_btn],
                   spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             self.search_progress,
-            ft.Row([
-                pill("Beatport", BEATPORT_COLOR, BEATPORT_SOFT, size=11, icon=ft.icons.SELL_OUTLINED),
-                pill("Bandcamp", BANDCAMP_COLOR, BANDCAMP_SOFT, size=11, icon=ft.icons.SELL_OUTLINED),
-                pill("Soulseek grátis", FREE_COLOR, FREE_SOFT, size=11, icon=ft.icons.DOWNLOAD_DONE),
-            ], spacing=8),
+            self.recent_row,
         )
 
         results_card = card(
             ft.Row([section_title(ft.icons.ALBUM, "Resultados"),
                    ft.Container(expand=True), self.results_count]),
             ft.Row([self.result_filter, self.source_filter], spacing=10),
-            ft.Divider(height=1, color="#EEEDF8"),
-            ft.Container(content=self.results_list, height=440),
+            ft.Divider(height=1, color=BORDER),
+            ft.Container(content=self.results_list, height=520),
         )
 
         jobs_card = card(
-            section_title(ft.icons.DOWNLOADING, "Downloads (Soulseek)", color=FREE_COLOR),
+            section_title(ft.icons.DOWNLOADING, "Downloads em andamento",
+                          "Se uma fonte falhar, o app tenta outra no mesmo formato sozinho.",
+                          color=FREE_COLOR),
             ft.Row([self.jobs_count, ft.Container(expand=True),
                    ft.TextButton("Limpar concluídos", icon=ft.icons.CLEANING_SERVICES,
                                 style=ft.ButtonStyle(color=MUTED),
                                 on_click=lambda e: self._clear_finished())]),
-            ft.Container(content=self.jobs_list, height=180),
+            ft.Container(content=self.jobs_list, height=520),
+        )
+
+        library_card = card(
+            ft.Row([
+                section_title(ft.icons.LIBRARY_MUSIC, "Biblioteca",
+                              "Tudo que você já baixou — fica salvo mesmo depois de fechar o app.",
+                              color=PRIMARY),
+                ft.Container(expand=True),
+                ft.OutlinedButton("Abrir pasta", icon=ft.icons.FOLDER_OPEN,
+                                  style=outline_style(PRIMARY),
+                                  on_click=lambda e: self._open_download_dir()),
+            ], vertical_alignment=ft.CrossAxisAlignment.START),
+            ft.Row([self.library_filter, self.library_sort, self.library_count], spacing=12),
+            self.color_filter_row,
+            self.analysis_status,
+            ft.Divider(height=1, color=BORDER),
+            ft.Container(content=self.library_list, height=560),
         )
 
         log_card = card(
             section_title(ft.icons.TERMINAL, "Log"),
-            ft.Container(content=self.log_area, height=120, bgcolor="#FAFAFD",
+            ft.Container(content=self.log_area, height=560, bgcolor=SUBTLE,
                         border_radius=RADIUS_MD, padding=10),
         )
 
-        scrollable = ft.Column(
-            [account_bar, search_card, results_card, jobs_card, log_card],
-            scroll=ft.ScrollMode.AUTO, expand=True, spacing=16,
+        def page_of(*controls):
+            # O AnimatedSwitcher centraliza o filho; o Container com alinhamento
+            # ocupa a área toda e prende a página no topo.
+            return ft.Container(
+                content=ft.Column([account_bar, *controls], scroll=ft.ScrollMode.AUTO,
+                                  spacing=16),
+                alignment=ft.alignment.top_center, expand=True)
+
+        self._pages = [page_of(search_card, results_card), page_of(jobs_card),
+                       page_of(library_card), page_of(self._crates_card()), page_of(log_card)]
+        self.page_switcher = ft.AnimatedSwitcher(
+            self._pages[NAV_DISCOVER], transition=ft.AnimatedSwitcherTransition.FADE,
+            duration=180, reverse_duration=120, expand=True,
         )
-        # A barra "tocando agora" fica fora da área rolável — sempre visível,
-        # não some quando a lista de resultados rola pra baixo.
-        return ft.Column([scrollable, self.now_playing_bar], expand=True, spacing=0)
+        body = ft.Row([
+            self.nav,
+            ft.VerticalDivider(width=1, color=BORDER),
+            ft.Container(content=self.page_switcher, expand=True, padding=22),
+        ], expand=True, spacing=0, vertical_alignment=ft.CrossAxisAlignment.STRETCH)
+        # A barra "tocando agora" fica fora das páginas — sempre visível,
+        # qualquer que seja a aba aberta.
+        return ft.Column([body, self.now_playing_bar], expand=True, spacing=0)
+
+    def _showing(self, index: int) -> bool:
+        switcher = getattr(self, "page_switcher", None)
+        return (switcher is not None and switcher.content is self._pages[index]
+                and self.control.content is self._main_layout)
+
+    def _showing_library(self) -> bool:
+        return self._showing(NAV_LIBRARY)
+
+    def _showing_crates(self) -> bool:
+        return self._showing(NAV_CRATES)
+
+    def _go_to(self, index: int) -> None:
+        self.nav.selected_index = index
+        self.page_switcher.content = self._pages[index]
+        if index == NAV_LIBRARY:
+            self._reload_library()
+        elif index == NAV_CRATES:
+            self._render_crates()
+        self._safe_update()
+
+    # ================= buscas recentes =================
+
+    def _load_recent_searches(self) -> list[dict]:
+        try:
+            data = json.loads((_data_dir() / "recent_searches.json").read_text(encoding="utf-8"))
+            return [d for d in data if isinstance(d, dict) and d.get("q")][:RECENT_SEARCHES_MAX]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _remember_search(self, text: str, mode: str) -> None:
+        text = text.strip()
+        self.recent_searches = [d for d in self.recent_searches
+                                if not (d["q"] == text and d.get("mode") == mode)]
+        self.recent_searches.insert(0, {"q": text, "mode": mode})
+        del self.recent_searches[RECENT_SEARCHES_MAX:]
+        try:
+            (_data_dir() / "recent_searches.json").write_text(
+                json.dumps(self.recent_searches, ensure_ascii=False), encoding="utf-8")
+        except OSError as ex:
+            self.log(f"Não foi possível salvar as buscas recentes: {ex}")
+        self._render_recent_searches()
+
+    def _clear_recent_searches(self) -> None:
+        self.recent_searches = []
+        try:
+            (_data_dir() / "recent_searches.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._render_recent_searches()
+        self._safe_update()
+
+    def _render_recent_searches(self) -> None:
+        self.recent_row.controls.clear()
+        self.recent_row.visible = bool(self.recent_searches)
+        if not self.recent_searches:
+            return
+        self.recent_row.controls.append(
+            ft.Text("Recentes", size=11, weight=ft.FontWeight.BOLD, color=MUTED))
+        for item in self.recent_searches:
+            one_line = " ".join(item["q"].split())
+            short = one_line if len(one_line) <= 38 else one_line[:36] + "…"
+            producer = item.get("mode") == "producer"
+            self.recent_row.controls.append(ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.icons.PERSON_OUTLINE if producer else ft.icons.HISTORY,
+                            size=13, color=PRIMARY),
+                    ft.Text(short, size=11, color=INK),
+                ], spacing=4, tight=True),
+                bgcolor=PRIMARY_SOFT, border_radius=20, tooltip=item["q"],
+                padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                on_click=lambda e, it=item: self._repeat_search(it["q"], it.get("mode", "tracks")),
+            ))
+        self.recent_row.controls.append(ft.IconButton(
+            ft.icons.CLOSE_ROUNDED, icon_size=14, icon_color=MUTED,
+            tooltip="Limpar buscas recentes", on_click=lambda e: self._clear_recent_searches()))
+
+    def _repeat_search(self, text: str, mode: str = "tracks") -> None:
+        if self.searching["value"]:
+            self._snack("Espere a busca atual terminar.", ft.colors.ORANGE_700)
+            return
+        self.search_mode.value = mode
+        self._change_search_mode()
+        self.query_field.value = text
+        self._go_to(NAV_DISCOVER)
+        self._start_search()
+
+    # ================= biblioteca =================
+
+    def _reload_library(self, analysis_delay: float = 0.0) -> None:
+        self._library = self.engine.history.recent(LIBRARY_LIMIT)
+        self._downloaded = {(e.get("username"), e.get("remote_path")) for e in self._library}
+        self._render_library()
+        paths = [e.get("local_path") for e in self._library if e.get("local_path")]
+        self._queue_analysis(paths, delay=analysis_delay)
+
+    def _render_library(self) -> None:
+        if not self._showing_library():
+            return  # _go_to desenha ao abrir a aba
+        self.library_list.controls.clear()
+        needle = (self.library_filter.value or "").casefold()
+        entries = self._sort_library([e for e in self._library
+                                      if self._library_matches(e, needle)])
+        total = len(self._library)
+        filtered = bool(needle) or self._color_filter is not None
+        self.library_count.value = (f"{len(entries)} de {total}" if filtered
+                                    else _plural(total, "música"))
+        self._render_color_filter()
+        if not self._library:
+            self.library_list.controls.append(ft.Container(
+                content=ft.Column([
+                    ft.Container(
+                        content=ft.Icon(ft.icons.LIBRARY_MUSIC_OUTLINED, size=30, color=PRIMARY),
+                        width=64, height=64, border_radius=32, bgcolor=PRIMARY_SOFT,
+                        alignment=ft.alignment.center,
+                    ),
+                    ft.Text("Sua biblioteca está vazia", size=15,
+                            weight=ft.FontWeight.BOLD, color=INK),
+                    ft.Text("Cada música que você baixar aparece aqui, com atalho pra ouvir.",
+                            size=12, color=MUTED),
+                ], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=40, alignment=ft.alignment.center,
+            ))
+        elif not entries:
+            self.library_list.controls.append(
+                ft.Text("Nada na biblioteca com esse nome.", size=12, color=MUTED))
+        for entry in entries[:self._library_shown]:
+            self.library_list.controls.append(self._library_row(entry))
+        remaining = len(entries) - self._library_shown
+        if remaining > 0:
+            self.library_list.controls.append(ft.Container(
+                content=ft.OutlinedButton(
+                    f"Mostrar mais ({remaining} restantes)", icon=ft.icons.EXPAND_MORE_ROUNDED,
+                    style=outline_style(PRIMARY), on_click=lambda e: self._show_more_library()),
+                alignment=ft.alignment.center, padding=8))
+        self._safe_update()
+
+    def _show_more_library(self) -> None:
+        self._library_shown += LIBRARY_PAGE
+        self._render_library()
+
+    def _library_row(self, entry: dict) -> ft.Container:
+        label = entry.get("label") or ""
+        title, _, fmt = label.rpartition(" · ")
+        if not title:
+            title, fmt = label, ""
+        path = entry.get("local_path") or ""
+        exists = bool(path) and os.path.exists(path)
+        size_mb = (entry.get("size") or 0) / (1024 * 1024)
+        meta = " · ".join(x for x in (
+            entry.get("quality") or "", f"{size_mb:.1f} MB" if size_mb else "",
+            _relative_time(entry.get("finished_at") or "")) if x)
+        if not exists:
+            meta += "  ·  arquivo não encontrado"
+
+        badge = ft.Container(
+            content=ft.Text((fmt or "?").upper(), size=10, weight=ft.FontWeight.BOLD,
+                            color=ft.colors.WHITE),
+            width=48, height=48, border_radius=12, alignment=ft.alignment.center,
+            gradient=ft.LinearGradient(
+                begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+                colors=[BRAND, "#7C3AED"] if exists else ["#A8A5BD", "#C4C2D4"],
+            ),
+        )
+        row = ft.Container(
+            content=ft.Row([
+                badge,
+                ft.Column([
+                    ft.Text(title, size=13, weight=ft.FontWeight.W_600,
+                            color=INK if exists else MUTED,
+                            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(meta, size=11, color=MUTED,
+                            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                ], spacing=2, tight=True, expand=True),
+                self._meta_pills(path),
+                self._play_button(path, title,
+                                  f"Biblioteca · {(fmt or '').upper()}".rstrip(" ·"), size=32),
+                *self._library_actions(entry, title, path, exists),
+            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=ft.padding.symmetric(horizontal=12, vertical=10),
+            bgcolor=SUBTLE, border_radius=RADIUS_MD, border=ft.border.all(1, BORDER),
+            animate=ft.Animation(140, ft.AnimationCurve.EASE_OUT),
+        )
+
+        def on_hover(e: ft.HoverEvent):
+            hovering = e.data == "true"
+            row.bgcolor = SURFACE if hovering else SUBTLE
+            row.border = ft.border.all(1, PRIMARY if hovering else BORDER)
+            row.update()
+
+        row.on_hover = on_hover
+        return row
+
+    def _open_file(self, path: str, reveal: bool = False) -> None:
+        try:
+            _open_path(path, reveal=reveal)
+        except Exception as ex:
+            self.log(f"Não foi possível abrir {path}: {ex}")
+            self._snack("Não foi possível abrir o arquivo.", ft.colors.ORANGE_700)
+
+    def _open_download_dir(self) -> None:
+        folder = self.config.download_dir
+        try:
+            os.makedirs(folder, exist_ok=True)
+            _open_path(folder)
+        except Exception as ex:
+            self.log(f"Não foi possível abrir a pasta {folder}: {ex}")
+
+    def _remove_from_library(self, entry_id) -> None:
+        if entry_id is None:
+            return
+        self.engine.history.remove(entry_id)
+        self._reload_library()
+        self._render_results()
 
     # ================= conexão =================
 
@@ -852,6 +1126,7 @@ class AggregatorView:
         if self.searching["value"]:
             return
         self._save_from_fields()
+        self._remember_search(name, "producer")
         self.searching["value"] = True
         self.search_btn.disabled = True
         self.search_mode.disabled = True
@@ -897,6 +1172,7 @@ class AggregatorView:
             return
 
         self._save_from_fields()
+        self._remember_search(raw, "tracks")
         self.searching["value"] = True
         self.search_btn.disabled = True
         self.search_progress.visible = True
@@ -989,7 +1265,7 @@ class AggregatorView:
             content=content, width=64, height=64, border_radius=12,
             gradient=ft.LinearGradient(
                 begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
-                colors=[PRIMARY, "#7C3AED"],
+                colors=[BRAND, "#7C3AED"],
             ),
             alignment=ft.alignment.center, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
         )
@@ -1026,8 +1302,8 @@ class AggregatorView:
                     self._soulseek_panel(query, result),
                 ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             ], spacing=12, tight=True),
-            padding=16, bgcolor="#FBFBFE", border_radius=RADIUS_MD,
-            border=ft.border.all(1, "#EEEDF8"),
+            padding=16, bgcolor=SUBTLE, border_radius=RADIUS_MD,
+            border=ft.border.all(1, BORDER),
         )
 
     # ---------- painéis de plataforma ----------
@@ -1039,8 +1315,8 @@ class AggregatorView:
                        ft.Text(title, size=12, weight=ft.FontWeight.BOLD, color=INK)], spacing=8),
                 body,
             ], spacing=10, tight=True),
-            expand=True, padding=14, bgcolor=ft.colors.WHITE, border_radius=RADIUS_MD,
-            border=ft.border.all(1, "#EEEDF8"),
+            expand=True, padding=14, bgcolor=SURFACE, border_radius=RADIUS_MD,
+            border=ft.border.all(1, BORDER),
             shadow=ft.BoxShadow(blur_radius=0, color=ft.colors.TRANSPARENT),
             animate=ft.Animation(160, ft.AnimationCurve.EASE_OUT),
             scale=1.0, animate_scale=ft.Animation(160, ft.AnimationCurve.EASE_OUT),
@@ -1051,7 +1327,7 @@ class AggregatorView:
             container.scale = 1.015 if hovering else 1.0
             container.shadow = soft_shadow(blur=20, dy=8, opacity=0.10) if hovering else \
                 ft.BoxShadow(blur_radius=0, color=ft.colors.TRANSPARENT)
-            container.border = ft.border.all(1, color if hovering else "#EEEDF8")
+            container.border = ft.border.all(1, color if hovering else BORDER)
             container.update()
 
         container.on_hover = on_hover
@@ -1132,7 +1408,7 @@ class AggregatorView:
                 *[self._format_row(query, result, fmt, by_format[fmt]) for fmt in SOULSEEK_FORMATS],
             ], spacing=6, tight=True)
         return self._panel_shell(ft.icons.PEOPLE_ALT_ROUNDED, "Soulseek", SOULSEEK_NEUTRAL,
-                                 "#F1F5F9", body)
+                                 FIELD_BG, body)
 
     def _format_row(self, query: str, result: TrackResult, fmt: str,
                     candidate: Optional[Candidate]) -> ft.Row:
@@ -1147,12 +1423,16 @@ class AggregatorView:
                 ft.Text("indisponível", size=10, color=MUTED, italic=True, expand=True),
             ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         detail = f"{candidate.quality_label} · {candidate.size_mb:.1f} MB"
+        already = (candidate.username, candidate.remote_path) in self._downloaded
         return ft.Row([
             tag,
             ft.Text(detail, size=10, color=MUTED, expand=True,
                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
-            ft.IconButton(ft.icons.DOWNLOAD_ROUNDED, icon_size=17, icon_color=FREE_COLOR,
-                         tooltip=f"Baixar em {fmt.upper()} — de {candidate.username}",
+            ft.IconButton(ft.icons.DOWNLOAD_DONE_ROUNDED if already else ft.icons.DOWNLOAD_ROUNDED,
+                         icon_size=17, icon_color=FREE_COLOR,
+                         tooltip=(f"Você já baixou esse arquivo — baixar de novo em {fmt.upper()}"
+                                  if already else
+                                  f"Baixar em {fmt.upper()} — de {candidate.username}"),
                          on_click=lambda e, q=query, r=result, c=candidate: self._download_candidate(q, r, c)),
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
@@ -1169,6 +1449,8 @@ class AggregatorView:
                             on_update=self._on_job_update)
         self.log(f"Na fila: {candidate.filename} ({candidate.quality_label}) de {candidate.username}")
         self._render_jobs()
+        self._snack(f"Na fila: {label}", action="Ver downloads",
+                    on_action=lambda e: self._go_to(NAV_DOWNLOADS))
 
     # ================= fila de downloads =================
 
@@ -1177,6 +1459,12 @@ class AggregatorView:
         if job.is_done or now - self._last_render >= RENDER_INTERVAL:
             self._last_render = now
             self._render_jobs()
+        if job.state == "complete" and not getattr(job, "_announced", False):
+            job._announced = True
+            self._reload_library()
+            self._render_results()
+            self._snack(f"Baixada: {job.label}", FREE_COLOR, action="Ver na biblioteca",
+                        on_action=lambda e: self._go_to(NAV_LIBRARY))
 
     def _clear_finished(self) -> None:
         self.engine.clear_finished_jobs()
@@ -1186,6 +1474,7 @@ class AggregatorView:
         jobs = self.engine.jobs()
         self.jobs_list.controls.clear()
         if not jobs:
+            self.nav_downloads.label = "Downloads"
             self.jobs_count.value = "Nenhum download na fila"
             self.jobs_list.controls.append(
                 ft.Container(content=ft.Text("A fila aparece aqui.", size=12, color=MUTED),
@@ -1196,6 +1485,8 @@ class AggregatorView:
 
         done = sum(1 for j in jobs if j.state == "complete")
         failed = sum(1 for j in jobs if j.state == "failed")
+        active = sum(1 for j in jobs if not j.is_done)
+        self.nav_downloads.label = f"Downloads ({active})" if active else "Downloads"
         self.jobs_count.value = (f"{_plural(len(jobs), 'item')} · {done} concluído(s) · "
                                  f"{failed} falhou(ram)")
         for job in jobs:
@@ -1229,13 +1520,13 @@ class AggregatorView:
                               color=INK, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
                        *right], spacing=6),
                 ft.ProgressBar(value=job.progress if job.state != "queued" else None,
-                             color=color, bgcolor="#F1F0F9", height=4, border_radius=2)
+                             color=color, bgcolor=FIELD_BG, height=4, border_radius=2)
                 if not job.is_done or job.state == "complete" else ft.Container(height=4),
                 ft.Text(detail, size=11, color=MUTED,
                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
             ], spacing=5, tight=True),
             padding=ft.padding.symmetric(horizontal=12, vertical=10),
-            bgcolor=ft.colors.WHITE, border_radius=RADIUS_SM,
+            bgcolor=SURFACE, border_radius=RADIUS_SM,
             border=ft.border.only(left=ft.BorderSide(3, color)),
         )
 

@@ -581,6 +581,14 @@ class DownloadHistory:
             except Exception:
                 return False
 
+    def remove(self, entry_id: int) -> None:
+        with self._lock:
+            try:
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute("DELETE FROM downloads WHERE id = ?", (entry_id,))
+            except Exception:
+                pass
+
     def recent(self, limit: int = 100) -> list[dict]:
         with self._lock:
             try:
@@ -1161,8 +1169,9 @@ class SoulseekEngine:
                 if outcome == "complete":
                     job.state = "complete"
                     job.detail = f"{cand.quality_label} — de {cand.username}"
-                    notify()
+                    # Grava antes de avisar a UI: ela recarrega a biblioteca no aviso.
                     self.history.add(job.label, cand, job.local_path)
+                    notify()
                     self.log(f"[{job.label}] ✅ concluído ({cand.quality_label}) → {job.local_path}")
                     return
                 if outcome == "cancelled":
