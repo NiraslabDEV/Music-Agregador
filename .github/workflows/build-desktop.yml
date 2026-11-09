@@ -35,6 +35,12 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
 
+      # O flet build empacota o requirements.txt da pasta do app, que e o da
+      # Vercel (flask/pytest). Sem esta troca o app instalado fica sem aioslsk,
+      # numpy e yt-dlp - e nem abre, porque as ferramentas de DJ importam numpy.
+      - name: Empacotar as dependencias do desktop
+        run: cp requirements-desktop.txt requirements.txt
+
       - name: Gravar versao no app
         run: sed -i.bak "s/^APP_BUILD_VERSION = .*/APP_BUILD_VERSION = \"$BUILD_VERSION\"/" main.py
 
@@ -46,6 +52,7 @@ jobs:
           --org "$ORG_NAME"
           --description "$APP_DESCRIPTION"
           --build-version "$BUILD_VERSION"
+          --exclude api tests
 
       - name: Empacotar em .dmg
         run: |
@@ -77,6 +84,10 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements-desktop.txt
 
+      - name: Empacotar as dependencias do desktop
+        shell: pwsh
+        run: Copy-Item requirements-desktop.txt requirements.txt -Force
+
       - name: Gravar versao no app
         shell: pwsh
         run: |
@@ -91,6 +102,7 @@ jobs:
           --org "$env:ORG_NAME"
           --description "$env:APP_DESCRIPTION"
           --build-version "$env:BUILD_VERSION"
+          --exclude api tests
 
       - name: Empacotar em .zip
         shell: pwsh
