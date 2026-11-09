@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import flet as ft
 
-from core import bandcamp, beatport, youtube
+from core import bandcamp, beatport, spotify
 from core.producer import search_producer
 from core.aggregator import Aggregator, TrackResult
 from core.local_media import LocalMediaServer
@@ -24,25 +24,31 @@ from core.ai_providers import PROVIDERS, AISettings
 from core.soulseek import Candidate, DownloadJob, dedupe_by_file, _data_dir
 from core.tracklist_parser import parse_tracklist_to_queries
 from core.youtube import YouTubeConfig
+from core.youtube_download import YouTubeJob, is_youtube_entry
 from ui.dj_tools import LIBRARY_PAGE, STARTUP_ANALYSIS_DELAY, DjToolsMixin
+from ui.favorites import FavoritesMixin
+from ui.youtube_view import YouTubeMixin
 from ui.theme import (
     PAGE_BG, SURFACE, SUBTLE, FIELD_BG, BORDER, INK, MUTED, PRIMARY, PRIMARY_SOFT, BRAND,
     PRIMARY_DARK, BEATPORT_COLOR, BANDCAMP_COLOR, FREE_COLOR, BEATPORT_SOFT, BANDCAMP_SOFT,
-    FREE_SOFT, SOULSEEK_NEUTRAL, RADIUS_LG, RADIUS_MD, RADIUS_SM, HEADER_GRADIENT, _plural,
+    FREE_SOFT, SOULSEEK_NEUTRAL, YOUTUBE_COLOR, SPOTIFY_COLOR, RADIUS_LG, RADIUS_MD, RADIUS_SM, HEADER_GRADIENT, _plural,
     soft_shadow, _relative_time, _open_path, card, section_title, pill, pstyle, outline_style,
     platform_badge,
 )
 
 SOULSEEK_FORMATS = ("flac", "wav", "mp3")
+SOULSEEK_ALL_PAGE = 80  # linhas por vez na lista completa (a busca guarda até 400)
 
 RENDER_INTERVAL = 0.8
 RECENT_SEARCHES_MAX = 8
 LIBRARY_LIMIT = 300
 
-NAV_DISCOVER, NAV_DOWNLOADS, NAV_LIBRARY, NAV_CRATES, NAV_LOG = range(5)
+NAV_DISCOVER, NAV_DOWNLOADS, NAV_LIBRARY, NAV_CRATES, NAV_FAVORITES, NAV_LOG = range(6)
 
 
-class AggregatorView(DjToolsMixin):
+class AggregatorView(DjToolsMixin, FavoritesMixin, YouTubeMixin):
+    NAV_DOWNLOADS, NAV_FAVORITES = NAV_DOWNLOADS, NAV_FAVORITES  # pros mixins
+
     def __init__(self, page: ft.Page):
         self.page = page
         self.aggregator = Aggregator(log_callback=self.log)
@@ -58,6 +64,8 @@ class AggregatorView(DjToolsMixin):
         self._play_buttons: dict[str, weakref.WeakSet] = {}
 
         self.result_groups: dict[str, TrackResult] = {}
+        # busca "Artista - Faixa" -> faixa do Spotify que a originou (prévia/link)
+        self._spotify_meta: dict[str, spotify.SpotifyTrack] = {}
         self.recent_searches: list[dict] = self._load_recent_searches()
         self._downloaded: set[tuple[str, str]] = set()
         self._library: list[dict] = []
@@ -66,6 +74,8 @@ class AggregatorView(DjToolsMixin):
         self._render_lock = threading.Lock()
 
         self._dj_init()
+        self._fav_init()
+        self._yt_init()
         self._build_controls()
         self._main_layout = self._build_layout()
         # Só carrega a lista e enfileira a análise; desenhar fica pra quando a
@@ -117,6 +127,7 @@ class AggregatorView(DjToolsMixin):
     def shutdown(self) -> None:
         self._stop_preview()
         self.media.shutdown()
+        self.yt.shutdown()
         try:
             self.aggregator.shutdown()
         except Exception:
@@ -242,9 +253,9 @@ class AggregatorView(DjToolsMixin):
 
 
         self.query_field = ft.TextField(
-            label="Faixa, lista separada por vírgula, ou um tracklist colado inteiro",
+            label="Faixa, lista separada por vírgula, tracklist colado ou link do Spotify",
             hint_text="New Order - Blue Monday, Daft Punk - Around The World  ·  ou cole um "
-                     "tracklist com horário e gravadora que a gente limpa sozinho",
+                     "tracklist, ou o link de uma música/álbum/playlist do Spotify",
             multiline=True, min_lines=1, max_lines=8, expand=True, **field_style,
         )
         self.search_mode = ft.Dropdown(
@@ -305,6 +316,7 @@ class AggregatorView(DjToolsMixin):
         self.library_count = ft.Text("", size=12, color=MUTED)
         self.library_list = ft.ListView(expand=True, spacing=8, auto_scroll=False)
         self._dj_build_controls()
+        self._fav_build_controls()
 
         self.nav_downloads = ft.NavigationRailDestination(
             icon=ft.icons.DOWNLOADING_OUTLINED, selected_icon=ft.icons.DOWNLOADING,
@@ -323,6 +335,9 @@ class AggregatorView(DjToolsMixin):
                 ft.NavigationRailDestination(icon=ft.icons.QUEUE_MUSIC_OUTLINED,
                                              selected_icon=ft.icons.QUEUE_MUSIC_ROUNDED,
                                              label="Crates"),
+                ft.NavigationRailDestination(icon=ft.icons.STAR_BORDER_ROUNDED,
+                                             selected_icon=ft.icons.STAR_ROUNDED,
+                                             label="Favoritas"),
                 ft.NavigationRailDestination(icon=ft.icons.TERMINAL_OUTLINED,
                                              selected_icon=ft.icons.TERMINAL, label="Log"),
             ],
@@ -368,9 +383,8 @@ class AggregatorView(DjToolsMixin):
                 content=ft.Column([
                     ft.Text("O regex já resolve a maioria dos tracklists colados — a IA só "
                            "entra em ação nas poucas linhas que ele não conseguir separar em "
-                           "artista/faixa. O YouTube é usado como opção de \"ouvir\" quando a "
-                           "faixa não aparece no Beatport nem no Bandcamp. Nada aqui é "
-                           "obrigatório.", size=12, color=MUTED),
+                           "artista/faixa. A busca do YouTube funciona sem chave; a chave só é "
+                           "usada de reserva se ela falhar. Nada aqui é obrigatório.", size=12, color=MUTED),
                     self.ai_provider_dd,
                     *key_rows,
                     ft.Divider(height=1, color=BORDER),
@@ -670,23 +684,6 @@ class AggregatorView(DjToolsMixin):
         self._play_buttons.setdefault(key, weakref.WeakSet()).add(btn)
         return btn
 
-    def _open_youtube_listen(self, query: str) -> None:
-        api_key = self.youtube_config.api_key
-        if not api_key:
-            self._snack("Configure a chave do YouTube primeiro (ícone do robô).",
-                        ft.colors.ORANGE_700)
-            self._open_ai_settings()
-            return
-
-        def worker():
-            video = youtube.best_match(query, api_key)
-            if video:
-                self.page.launch_url(video.url)
-            else:
-                self._snack("Nada encontrado no YouTube para essa busca.", ft.colors.ORANGE_700)
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _build_login_screen(self) -> ft.Container:
         """Primeira tela do app: uma conta só, sem mencionar a rede por trás
         (Soulseek) — a pessoa só vê "conectar" e ganha acesso a tudo."""
@@ -774,7 +771,8 @@ class AggregatorView(DjToolsMixin):
                 ft.OutlinedButton("Abrir pasta", icon=ft.icons.FOLDER_OPEN,
                                   style=outline_style(PRIMARY),
                                   on_click=lambda e: self._open_download_dir()),
-            ], vertical_alignment=ft.CrossAxisAlignment.START),
+                self._yt_folder_button(),
+            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             ft.Row([self.library_filter, self.library_sort, self.library_count], spacing=12),
             self.color_filter_row,
             self.analysis_status,
@@ -797,7 +795,8 @@ class AggregatorView(DjToolsMixin):
                 alignment=ft.alignment.top_center, expand=True)
 
         self._pages = [page_of(search_card, results_card), page_of(jobs_card),
-                       page_of(library_card), page_of(self._crates_card()), page_of(log_card)]
+                       page_of(library_card), page_of(self._crates_card()),
+                       page_of(self._favorites_card()), page_of(log_card)]
         self.page_switcher = ft.AnimatedSwitcher(
             self._pages[NAV_DISCOVER], transition=ft.AnimatedSwitcherTransition.FADE,
             duration=180, reverse_duration=120, expand=True,
@@ -829,6 +828,8 @@ class AggregatorView(DjToolsMixin):
             self._reload_library()
         elif index == NAV_CRATES:
             self._render_crates()
+        elif index == NAV_FAVORITES:
+            self._render_favorites()
         self._safe_update()
 
     # ================= buscas recentes =================
@@ -965,13 +966,20 @@ class AggregatorView(DjToolsMixin):
         if not exists:
             meta += "  ·  arquivo não encontrado"
 
+        from_youtube = is_youtube_entry(entry)
+        if from_youtube:
+            badge_content = ft.Icon(ft.icons.SMART_DISPLAY_ROUNDED, color=ft.colors.WHITE, size=22)
+            colors = [YOUTUBE_COLOR, "#F97316"]
+        else:
+            badge_content = ft.Text((fmt or "?").upper(), size=10, weight=ft.FontWeight.BOLD,
+                                    color=ft.colors.WHITE)
+            colors = [BRAND, "#7C3AED"]
         badge = ft.Container(
-            content=ft.Text((fmt or "?").upper(), size=10, weight=ft.FontWeight.BOLD,
-                            color=ft.colors.WHITE),
+            content=badge_content, tooltip="Baixada do YouTube" if from_youtube else None,
             width=48, height=48, border_radius=12, alignment=ft.alignment.center,
             gradient=ft.LinearGradient(
                 begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
-                colors=[BRAND, "#7C3AED"] if exists else ["#A8A5BD", "#C4C2D4"],
+                colors=colors if exists else ["#A8A5BD", "#C4C2D4"],
             ),
         )
         row = ft.Container(
@@ -1111,8 +1119,8 @@ class AggregatorView(DjToolsMixin):
 
     def _change_search_mode(self) -> None:
         producer = self.search_mode.value == "producer"
-        self.query_field.label = "Nome artístico do produtor" if producer else "Faixa ou tracklist"
-        self.query_field.hint_text = "Ex.: Claudio PRC" if producer else "Artista - Faixa, ou cole um tracklist"
+        self.query_field.label = "Nome artístico do produtor" if producer else "Faixa, tracklist ou link do Spotify"
+        self.query_field.hint_text = "Ex.: Claudio PRC" if producer else "Artista - Faixa, um tracklist ou open.spotify.com/…"
         self.query_field.max_lines = 1 if producer else 8
         self.producer_notice.visible = producer
         self.producer_notice.value = "Créditos das lojas filtrados pelo nome exato. Soulseek: correspondências por nome de arquivo, sem autenticação do áudio."
@@ -1164,19 +1172,67 @@ class AggregatorView(DjToolsMixin):
         raw = self.query_field.value or ""
         if self.searching["value"]:
             return
-        queries = parse_tracklist_to_queries(raw, ai_settings=self.ai_settings, log=self.log)
-        if not queries:
-            self._snack("Digite ao menos uma faixa.", ft.colors.ORANGE_700)
-            return
-        if self.searching["value"]:
+        links = spotify.find_links(raw)
+        if not links:
+            queries = parse_tracklist_to_queries(raw, ai_settings=self.ai_settings, log=self.log)
+            if not queries:
+                self._snack("Digite ao menos uma faixa.", ft.colors.ORANGE_700)
+                return
+            self._run_search(raw, queries)
             return
 
+        # Link do Spotify: lê a faixa/álbum/playlist antes (rede), fora da tela.
+        self._set_searching(True)
+        self._snack(f"Lendo {_plural(len(links), 'link')} do Spotify…")
+
+        def resolve():
+            try:
+                queries = self._resolve_spotify(raw, links)
+            except Exception as ex:
+                self.log(f"Spotify: {ex}")
+                queries = []
+            if not queries:
+                self._set_searching(False)
+                self._snack("Não consegui ler esse link do Spotify (privado, apagado ou "
+                            "sem internet?).", ft.colors.ORANGE_700)
+                return
+            self._run_search(raw, queries, already_marked=True)
+
+        threading.Thread(target=resolve, daemon=True).start()
+
+    def _set_searching(self, on: bool) -> None:
+        self.searching["value"] = on
+        self.search_btn.disabled = on
+        self.search_progress.visible = on
+        self.search_progress.value = None if on else 0
+        self._safe_update()
+
+    def _resolve_spotify(self, raw: str, links: list[tuple[str, str]]) -> list[str]:
+        """Links viram "Artista - Faixa"; o resto do texto é buscado como sempre."""
+        queries, failed = [], 0
+        for kind, item_id in links:
+            item = spotify.fetch(kind, item_id)
+            if item is None:
+                failed += 1
+                continue
+            label = {"track": "faixa", "album": "álbum", "playlist": "playlist"}[kind]
+            self.log(f"Spotify: {label} “{item.name}” — {_plural(len(item.tracks), 'faixa')}")
+            for track in item.tracks:
+                self._spotify_meta[track.query] = track
+                queries.append(track.query)
+        if failed:
+            self.log(f"Spotify: {_plural(failed, 'link')} não pôde ser lido")
+        rest = spotify.strip_links(raw).strip()
+        if rest:
+            queries += parse_tracklist_to_queries(rest, ai_settings=self.ai_settings, log=self.log)
+        return list(dict.fromkeys(queries))
+
+    def _run_search(self, raw: str, queries: list[str], already_marked: bool = False) -> None:
+        if self.searching["value"] and not already_marked:
+            return
         self._save_from_fields()
         self._remember_search(raw, "tracks")
-        self.searching["value"] = True
-        self.search_btn.disabled = True
-        self.search_progress.visible = True
-        self.search_progress.value = None
+        self._set_searching(True)
         self.result_groups = {q: TrackResult(query=q) for q in queries}
         self._safe_update()
 
@@ -1184,6 +1240,8 @@ class AggregatorView(DjToolsMixin):
 
         def on_update(query, result):
             self.result_groups[query] = result
+            if result.done:
+                self._record_favorite_result(query, result)
             now = time.monotonic()
             if result.done or now - self._last_render >= RENDER_INTERVAL:
                 self._last_render = now
@@ -1197,10 +1255,7 @@ class AggregatorView(DjToolsMixin):
             except Exception as ex:
                 self.log(f"Erro na busca: {ex}")
             finally:
-                self.searching["value"] = False
-                self.search_btn.disabled = False
-                self.search_progress.visible = False
-                self.search_progress.value = 0
+                self._set_searching(False)
                 self._render_results()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1289,12 +1344,15 @@ class AggregatorView(DjToolsMixin):
                         ], spacing=6),
                     ], spacing=4, tight=True, expand=True,
                        alignment=ft.MainAxisAlignment.CENTER),
-                    ft.IconButton(
-                        ft.icons.SMART_DISPLAY_OUTLINED, icon_color=MUTED, icon_size=22,
-                        tooltip="Ouvir no YouTube (abre no navegador) — bom pra faixa que "
-                               "não apareceu no Beatport/Bandcamp",
-                        on_click=lambda e, q=query: self._open_youtube_listen(q),
+                    *self._spotify_buttons(query),
+                    ft.OutlinedButton(
+                        "YouTube", icon=ft.icons.SMART_DISPLAY_ROUNDED,
+                        style=outline_style(YOUTUBE_COLOR),
+                        tooltip="Ouvir ou baixar o áudio do YouTube — pra faixa que não tem "
+                               "no Soulseek (vai pra uma pasta separada)",
+                        on_click=lambda e, q=query: self._open_youtube_dialog(q),
                     ),
+                    self._fav_star_button(query, result),
                 ], spacing=12),
                 ft.Row([
                     self._beatport_panel(result),
@@ -1305,6 +1363,22 @@ class AggregatorView(DjToolsMixin):
             padding=16, bgcolor=SUBTLE, border_radius=RADIUS_MD,
             border=ft.border.all(1, BORDER),
         )
+
+    def _spotify_buttons(self, query: str) -> list:
+        track = self._spotify_meta.get(query)
+        if track is None:
+            return []
+        buttons = []
+        if track.preview_url:
+            buttons.append(self._preview_button(
+                f"spotify:{track.track_id}", SPOTIFY_COLOR, lambda u=track.preview_url: u,
+                title=track.title, subtitle=f"{track.artist_label} · prévia do Spotify",
+                idle_tooltip="Ouvir a prévia de 30 s do Spotify"))
+        buttons.append(ft.IconButton(
+            ft.icons.OPEN_IN_NEW_ROUNDED, icon_color=SPOTIFY_COLOR, icon_size=20,
+            tooltip="Abrir no Spotify (veio de um link do Spotify)",
+            url=track.url, url_target=ft.UrlTarget.BLANK))
+        return buttons
 
     # ---------- painéis de plataforma ----------
 
@@ -1406,6 +1480,13 @@ class AggregatorView(DjToolsMixin):
                     ft.Text(_plural(fontes, "fonte"), size=10, color=MUTED),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 *[self._format_row(query, result, fmt, by_format[fmt]) for fmt in SOULSEEK_FORMATS],
+                ft.TextButton(
+                    f"Ver todos os {_plural(len(result.soulseek), 'arquivo')}",
+                    icon=ft.icons.LIST_ROUNDED, style=outline_style(SOULSEEK_NEUTRAL),
+                    tooltip="Lista completa do Soulseek — para testar outras fontes "
+                            "quando as melhores não baixam",
+                    on_click=lambda e, q=query, r=result: self._open_soulseek_all(q, r),
+                ),
             ], spacing=6, tight=True)
         return self._panel_shell(ft.icons.PEOPLE_ALT_ROUNDED, "Soulseek", SOULSEEK_NEUTRAL,
                                  FIELD_BG, body)
@@ -1436,16 +1517,116 @@ class AggregatorView(DjToolsMixin):
                          on_click=lambda e, q=query, r=result, c=candidate: self._download_candidate(q, r, c)),
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-    def _download_candidate(self, query: str, result: TrackResult, candidate: Candidate) -> None:
+    def _open_soulseek_all(self, query: str, result: TrackResult) -> None:
+        """Todos os arquivos que a busca achou, não só o melhor de cada formato.
+
+        A nota escolhe bem na média, mas na rede P2P o "melhor" às vezes está
+        offline ou com a fila travada — aqui a pessoa testa fonte por fonte."""
+        pool = list(result.soulseek)  # já filtrado e ordenado pela nota
+        shown = {"n": SOULSEEK_ALL_PAGE}
+        needle_field = ft.TextField(
+            hint_text="Filtrar por nome, pasta ou usuário", prefix_icon=ft.icons.SEARCH,
+            dense=True, expand=True, border_radius=RADIUS_SM, filled=True, bgcolor=FIELD_BG,
+        )
+        format_dd = ft.Dropdown(
+            value="all", width=130, dense=True,
+            options=[ft.dropdown.Option("all", "Todos"),
+                     *[ft.dropdown.Option(f, f.upper()) for f in SOULSEEK_FORMATS],
+                     ft.dropdown.Option("other", "Outros")],
+        )
+        count = ft.Text("", size=11, color=MUTED)
+        rows = ft.ListView(spacing=4, height=460)
+
+        def matches(c: Candidate, needle: str, fmt: str) -> bool:
+            if fmt == "other" and c.ext in SOULSEEK_FORMATS:
+                return False
+            if fmt not in ("all", "other") and c.ext != fmt:
+                return False
+            return not needle or needle in c.remote_path.casefold() \
+                or needle in c.username.casefold()
+
+        def render(reset: bool = False) -> None:
+            if reset:
+                shown["n"] = SOULSEEK_ALL_PAGE
+            needle = (needle_field.value or "").strip().casefold()
+            found = [c for c in pool if matches(c, needle, format_dd.value or "all")]
+            users = len({c.username for c in found})
+            count.value = f"{_plural(len(found), 'arquivo')} de {_plural(users, 'usuário')}"
+            rows.controls = [self._soulseek_all_row(query, result, c)
+                             for c in found[:shown["n"]]]
+            if len(found) > shown["n"]:
+                rows.controls.append(ft.TextButton(
+                    f"Mostrar mais ({len(found) - shown['n']} restantes)",
+                    on_click=lambda e: (shown.update(n=shown["n"] + SOULSEEK_ALL_PAGE),
+                                        render()),
+                ))
+            self._safe_update()
+
+        needle_field.on_change = lambda e: render(reset=True)
+        format_dd.on_change = lambda e: render(reset=True)
+        render()
+        self._show_dialog(ft.AlertDialog(
+            title=ft.Text(f"Soulseek · {query}", size=16, weight=ft.FontWeight.BOLD, color=INK,
+                          max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+            content=ft.Column([
+                ft.Row([needle_field, format_dd], spacing=8),
+                count,
+                rows,
+            ], spacing=8, tight=True, width=640),
+            actions=[ft.TextButton("Fechar", on_click=lambda e: self._close_dialog())],
+        ))
+
+    def _soulseek_all_row(self, query: str, result: TrackResult, c: Candidate) -> ft.Container:
+        already = c.key in self._downloaded
+        slots = "slot livre" if c.free_slots else f"fila {c.queue_size}"
+        detail = " · ".join([c.quality_label, f"{c.size_mb:.1f} MB", c.duration_label,
+                             c.username, slots, c.speed_label])
+        button = ft.IconButton(
+            ft.icons.DOWNLOAD_DONE_ROUNDED if already else ft.icons.DOWNLOAD_ROUNDED,
+            icon_size=18, icon_color=FREE_COLOR,
+            tooltip=f"Baixar exatamente este arquivo de {c.username}",
+        )
+
+        def download(e):
+            self._download_candidate(query, result, c, exact=True)
+            button.icon, button.tooltip = ft.icons.SCHEDULE_ROUNDED, "Na fila de downloads"
+            self._update_controls(button)
+
+        button.on_click = download
+        return ft.Container(
+            content=ft.Row([
+                ft.Column([
+                    ft.Text(c.filename, size=12, weight=ft.FontWeight.W_600, color=INK,
+                            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(detail, size=10, color=MUTED,
+                            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                ], spacing=2, tight=True, expand=True),
+                button,
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            tooltip=c.remote_path,
+            padding=ft.padding.symmetric(horizontal=10, vertical=6),
+            bgcolor=SUBTLE, border_radius=RADIUS_SM,
+        )
+
+    def _download_candidate(self, query: str, result: TrackResult, candidate: Candidate,
+                            exact: bool = False) -> None:
         if not self.engine.is_connected:
             self._snack("Conecte sua conta primeiro.", ft.colors.ORANGE_700)
             self._show_login_screen()
             return
-        # Fallback só entre fontes do mesmo formato: quem escolheu FLAC não quer
-        # que a fila caia num MP3 silenciosamente se a fonte escolhida falhar.
-        same_format_pool = [c for c in result.soulseek if c.ext == candidate.ext]
-        label = f"{query} · {candidate.ext.upper()}"
-        self.engine.enqueue(candidate, pool=same_format_pool, label=label,
+        if exact:
+            # Escolhido a dedo na lista completa: tenta só essa fonte, senão a
+            # pessoa não sabe qual das fontes funcionou ou falhou.
+            # Mesmo rótulo do download normal: a Biblioteca tira título e
+            # formato do rótulo (antes/depois do último " · ").
+            pool = None
+            label = f"{query} · {candidate.ext.upper()}"
+        else:
+            # Fallback só entre fontes do mesmo formato: quem escolheu FLAC não quer
+            # que a fila caia num MP3 silenciosamente se a fonte escolhida falhar.
+            pool = [c for c in result.soulseek if c.ext == candidate.ext]
+            label = f"{query} · {candidate.ext.upper()}"
+        self.engine.enqueue(candidate, pool=pool, label=label,
                             on_update=self._on_job_update)
         self.log(f"Na fila: {candidate.filename} ({candidate.quality_label}) de {candidate.username}")
         self._render_jobs()
@@ -1463,15 +1644,24 @@ class AggregatorView(DjToolsMixin):
             job._announced = True
             self._reload_library()
             self._render_results()
+            self._render_favorites()  # a favorita passa a "já na biblioteca"
             self._snack(f"Baixada: {job.label}", FREE_COLOR, action="Ver na biblioteca",
                         on_action=lambda e: self._go_to(NAV_LIBRARY))
 
     def _clear_finished(self) -> None:
         self.engine.clear_finished_jobs()
+        self.yt.clear_finished()
+        self._render_jobs()
+
+    def _cancel_job(self, job) -> None:
+        if isinstance(job, YouTubeJob):
+            self.yt.cancel(job)
+        else:
+            self.engine.cancel(job)
         self._render_jobs()
 
     def _render_jobs(self) -> None:
-        jobs = self.engine.jobs()
+        jobs = self.yt.jobs() + self.engine.jobs()
         self.jobs_list.controls.clear()
         if not jobs:
             self.nav_downloads.label = "Downloads"
@@ -1500,6 +1690,7 @@ class AggregatorView(DjToolsMixin):
             "cancelled": (MUTED, ft.icons.CANCEL),
             "downloading": (PRIMARY, ft.icons.DOWNLOADING),
             "queued": ("#D97706", ft.icons.HOURGLASS_TOP),
+            "converting": (PRIMARY, ft.icons.SYNC_ROUNDED),
         }
         color, icon = palette.get(job.state, (MUTED, ft.icons.SCHEDULE))
         detail = job.detail or job.error or ""
@@ -1511,11 +1702,12 @@ class AggregatorView(DjToolsMixin):
         if not job.is_done:
             right.append(ft.IconButton(ft.icons.CLOSE, icon_size=16, icon_color=MUTED,
                                        tooltip="Cancelar",
-                                       on_click=lambda e, j=job: (self.engine.cancel(j),
-                                                                  self._render_jobs())))
+                                       on_click=lambda e, j=job: self._cancel_job(j)))
         return ft.Container(
             content=ft.Column([
                 ft.Row([ft.Icon(icon, size=16, color=color),
+                       *([ft.Icon(ft.icons.SMART_DISPLAY_ROUNDED, size=16, color=YOUTUBE_COLOR,
+                                  tooltip="Do YouTube")] if isinstance(job, YouTubeJob) else []),
                        ft.Text(job.label, size=12, weight=ft.FontWeight.W_500, expand=True,
                               color=INK, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
                        *right], spacing=6),

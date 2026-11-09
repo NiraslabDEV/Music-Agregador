@@ -569,6 +569,21 @@ class DownloadHistory:
             except Exception:
                 pass
 
+    def add_entry(self, label: str, username: str, remote_path: str, local_path: str,
+                  size: int, quality: str) -> None:
+        """Download que não veio do Soulseek (ex.: YouTube) — entra na mesma
+        Biblioteca, com BPM/tom, crates e player."""
+        with self._lock:
+            try:
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute(
+                        "INSERT INTO downloads (label, username, remote_path, local_path, size, quality)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (label, username, remote_path, local_path, size, quality),
+                    )
+            except Exception:
+                pass
+
     def has(self, c: Candidate) -> bool:
         with self._lock:
             try:

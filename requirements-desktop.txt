@@ -4,3 +4,4 @@ aioslsk==1.6.3
 numpy>=2.0
 soundfile>=0.12
 mutagen>=1.47
+yt-dlp>=2025.1.1

@@ -11,6 +11,8 @@
      Krumhansl-Kessler das 24 tonalidades.
 """
 
+import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
@@ -81,9 +83,36 @@ def read_tags(path: str) -> tuple[Optional[float], Optional[str]]:
 
 # ============================== ÁUDIO ==============================
 
+def _load_mono_ffmpeg(path: str, skip: float, seconds: float) -> Optional[np.ndarray]:
+    """M4A/AAC/Opus (ex.: áudio baixado do YouTube) o libsndfile não abre;
+    com ffmpeg no PATH ele decodifica direto em mono, já na taxa da análise."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    cmd = [ffmpeg, "-v", "error", "-nostdin", "-t", str(skip + seconds), "-i", path,
+           "-vn", "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=120,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    mono = np.frombuffer(proc.stdout, dtype=np.float32)
+    start = skip if len(mono) / SR > skip + 30 else 0  # mesma regra do caminho normal
+    return mono[int(start * SR):int((start + seconds) * SR)].copy()
+
+
 def load_mono(path: str, skip: float = SKIP_SECONDS, seconds: float = MAX_SECONDS) -> np.ndarray:
     import soundfile as sf
-    with sf.SoundFile(path) as f:
+    try:
+        f = sf.SoundFile(path)
+    except Exception:
+        decoded = _load_mono_ffmpeg(path, skip, seconds)
+        if decoded is None:
+            raise
+        return decoded
+    with f:
         native = f.samplerate
         total = f.frames / native if f.frames > 0 else 0
         start = skip if total > skip + 30 else 0  # faixa curta: usa do começo

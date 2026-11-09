@@ -1,7 +1,11 @@
-"""Análises de BPM/tom (cache) e crates, num SQLite na pasta de dados do app.
+"""Análises de BPM/tom (cache), crates e favoritas, num SQLite na pasta de dados do app.
 
 Crates guardam caminho + nome da faixa (não o id do histórico): tirar uma
 música da lista da Biblioteca não deve desmontar um set já montado.
+
+Favoritas são faixas que a pessoa quer ter, baixadas ou não — guardam a busca
+(texto) e o resultado da última verificação, pra ela voltar depois e ver se a
+faixa já apareceu no Soulseek.
 """
 
 import os
@@ -43,6 +47,18 @@ class LibraryStore:
                     position    INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_crate_tracks ON crate_tracks(crate_id, position);
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    cover_url      TEXT DEFAULT '',
+                    beatport_url   TEXT DEFAULT '',
+                    bandcamp_url   TEXT DEFAULT '',
+                    price          TEXT DEFAULT '',
+                    added_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+                    checked_at     TEXT,
+                    soulseek_count INTEGER,
+                    soulseek_best  TEXT DEFAULT ''
+                );
                 CREATE TABLE IF NOT EXISTS prefs (
                     key   TEXT PRIMARY KEY,
                     value TEXT
@@ -162,3 +178,57 @@ class LibraryStore:
         j = max(0, min(len(ids) - 1, i + delta))
         ids.insert(j, ids.pop(i))
         self.set_order(crate_id, ids)
+
+    # ---------------- favoritas ----------------
+
+    def favorites(self) -> list[dict]:
+        with self._lock, self._conn() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM favorites ORDER BY id DESC")]
+
+    def favorite(self, query: str) -> Optional[dict]:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM favorites WHERE query = ?",
+                               (query.strip(),)).fetchone()
+            return dict(row) if row else None
+
+    def add_favorite(self, query: str, **info) -> int:
+        """Cria (ou devolve, se já existe) a favorita. `info` só preenche
+        campos vazios — favoritar de novo não apaga a última verificação."""
+        query = " ".join((query or "").split())
+        if not query:
+            raise ValueError("busca vazia")
+        with self._lock, self._conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO favorites (query) VALUES (?)", (query,))
+            fav_id = conn.execute("SELECT id FROM favorites WHERE query = ?",
+                                  (query,)).fetchone()[0]
+            self._fill_store_info(conn, fav_id, info)
+            return fav_id
+
+    def remove_favorite(self, fav_id: int) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("DELETE FROM favorites WHERE id = ?", (fav_id,))
+
+    def record_check(self, fav_id: int, soulseek_count: int, soulseek_best: str = "",
+                     **info) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("UPDATE favorites SET checked_at = CURRENT_TIMESTAMP,"
+                         " soulseek_count = ?, soulseek_best = ? WHERE id = ?",
+                         (soulseek_count, soulseek_best or "", fav_id))
+            self._fill_store_info(conn, fav_id, info, overwrite=True)
+
+    @staticmethod
+    def _fill_store_info(conn, fav_id: int, info: dict, overwrite: bool = False) -> None:
+        for column in ("cover_url", "beatport_url", "bandcamp_url", "price"):
+            value = (info.get(column) or "").strip()
+            if not value:
+                continue  # não apaga um link bom porque a loja não respondeu agora
+            where = "" if overwrite else " AND COALESCE(" + column + ", '') = ''"
+            conn.execute(f"UPDATE favorites SET {column} = ? WHERE id = ?{where}",
+                         (value, fav_id))
+
+
+def favorite_status(fav: dict) -> str:
+    """'never' (nunca verificada), 'missing' (não estava no Soulseek) ou 'available'."""
+    if not fav.get("checked_at") or fav.get("soulseek_count") is None:
+        return "never"
+    return "available" if fav["soulseek_count"] > 0 else "missing"

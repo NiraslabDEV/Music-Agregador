@@ -35,6 +35,11 @@ BEATPORT_SOFT = ft.colors.with_opacity(0.13, BEATPORT_COLOR)
 BANDCAMP_SOFT = ft.colors.with_opacity(0.13, BANDCAMP_COLOR)
 FREE_SOFT = ft.colors.with_opacity(0.13, FREE_COLOR)
 SOULSEEK_NEUTRAL = MUTED     # cor neutra do painel Soulseek (o destaque é o verde do preço)
+YOUTUBE_COLOR = "#DC2626"    # vermelho — áudio baixado do YouTube
+YOUTUBE_SOFT = ft.colors.with_opacity(0.13, YOUTUBE_COLOR)
+STAR_COLOR = "#F59E0B"       # âmbar das favoritas
+SPOTIFY_COLOR = "#10B981"    # verde-esmeralda — faixas que vieram de link do Spotify
+WARN_COLOR = "#D97706"
 
 RADIUS_LG = 18
 RADIUS_MD = 14

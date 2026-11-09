@@ -125,3 +125,55 @@ Arquivos sem essa evidência são omitidos. Esses nomes são fornecidos por usu�
 a associação não certifica autoria ou conteúdo do áudio. É necessário estar
 conectado ao Soulseek. A busca por produtor está no programa desktop; a página
 web continua oferecendo a busca simples das lojas e o download do programa.
+
+## Baixar do YouTube (app desktop)
+
+O botão **YouTube** em cada faixa abre a lista de vídeos da busca (sem chave de
+API — usa o `yt-dlp`). Você escolhe o vídeo certo (dá pra abrir no navegador e
+ouvir antes) e clica em **Baixar áudio**. O download aparece na fila de
+Downloads e, quando termina, entra na Biblioteca com um selo vermelho do
+YouTube (com BPM/tom, player e crates, igual às outras).
+
+Os arquivos vão para uma pasta **separada** da do Soulseek — por padrão
+`~/Music/YouTube`, dá pra trocar no próprio diálogo. Separada de propósito: a
+qualidade é a do YouTube (AAC ~128 kbps, não é FLAC) e a pasta do Soulseek é
+compartilhada na rede, essa não.
+
+Com `ffmpeg` no PATH o áudio sai sempre em `.m4a` (vídeos que só têm Opus são
+convertidos) e a análise de BPM/tom consegue ler `.m4a`. Sem ffmpeg, o app
+baixa o `.m4a` que o YouTube já oferece, mas a análise de BPM/tom desses
+arquivos falha (dá pra corrigir à mão em "Corrigir BPM/tom").
+
+## Favoritas (app desktop)
+
+A estrela em cada faixa guarda ela na aba **Favoritas** — mesmo que o Soulseek
+não tenha a faixa hoje. Também dá pra adicionar uma favorita direto, sem buscar
+("Adicionar"). Cada favorita mostra o resultado da última verificação: sem
+fonte no Soulseek, com fonte (quantas e a melhor qualidade) ou já na
+biblioteca.
+
+- **⟳ Verificar** busca de novo nas três fontes; se o Soulseek tiver a faixa,
+  os botões de download (FLAC/WAV/MP3 e "ver todos") aparecem na própria linha.
+- **Verificar todas** passa por todas que ainda não estão na biblioteca, uma
+  de cada vez, e avisa quais apareceram no Soulseek.
+- Toda busca normal em Descobrir de uma faixa favoritada também atualiza a
+  favorita.
+
+Só o resumo da verificação fica salvo; as fontes do Soulseek não (na rede P2P,
+quem tinha a faixa ontem pode estar offline hoje) — por isso o botão de baixar
+pede uma verificação nova.
+
+## Links do Spotify (app desktop)
+
+Cole no campo de busca o link de uma **música, álbum ou playlist** do Spotify
+(sozinho ou junto com outras faixas/tracklist). O app lê os nomes e artistas e
+busca cada faixa no Beatport, Bandcamp e Soulseek, como uma lista colada. Os
+cards que vieram do Spotify ganham a prévia de 30 s e um atalho pra abrir a
+faixa lá.
+
+Não precisa de conta de desenvolvedor: o app lê a página de "embed" (o player
+que o Spotify deixa qualquer site incorporar). Por isso playlists muito grandes
+podem vir cortadas, e playlists privadas não abrem.
+
+O Spotify é só referência — **o áudio de lá não é baixado**: ele é protegido
+por DRM. Pra ter o arquivo, use o Soulseek, a loja ou o botão YouTube do card.

@@ -1,11 +1,8 @@
-"""Busca no YouTube — última opção pra "ouvir e confirmar que é a música certa"
-quando Beatport e Bandcamp não têm a faixa (remix raro, edit de DJ, etc.).
+"""Busca no YouTube pela API oficial — reserva da busca do yt-dlp.
 
-Usa a YouTube Data API v3 oficial (precisa de uma chave grátis, cota diária
-generosa pra uso pessoal — console.cloud.google.com, "YouTube Data API v3").
-Só devolve o vídeo e o link: a busca abre o player do próprio YouTube no
-navegador (`page.launch_url`), sem baixar nem embutir stream nenhum — o app
-já evita esse tipo de automação pras lojas (ver README), o mesmo vale aqui.
+A busca principal (e o download do áudio) fica em core/youtube_download.py e
+não precisa de chave. Esta, pela YouTube Data API v3 (chave grátis em
+console.cloud.google.com), só entra se a outra falhar e houver chave salva.
 """
 
 from __future__ import annotations
@@ -25,9 +22,10 @@ REQUEST_TIMEOUT = 10
 
 @dataclass
 class YouTubeConfig:
-    """Só a chave de API — sem cadastro/login, é uma credencial de projeto Google."""
+    """Chave da API (opcional) e a pasta onde caem os áudios baixados do YouTube."""
 
     api_key: str = ""
+    download_dir: str = ""   # vazio = ~/Music/YouTube
 
     @classmethod
     def path(cls) -> Path:
@@ -39,13 +37,16 @@ class YouTubeConfig:
         try:
             raw = json.loads(cls.path().read_text(encoding="utf-8"))
             cfg.api_key = raw.get("api_key", "") or ""
+            cfg.download_dir = raw.get("download_dir", "") or ""
         except Exception:
             pass
         return cfg
 
     def save(self) -> None:
         try:
-            self.path().write_text(json.dumps({"api_key": self.api_key}, indent=2), encoding="utf-8")
+            self.path().write_text(
+                json.dumps({"api_key": self.api_key, "download_dir": self.download_dir},
+                           indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -56,6 +57,7 @@ class YouTubeVideo:
     title: str
     channel: str = ""
     thumbnail_url: str = ""
+    duration: int = 0   # segundos; a API de busca não informa (fica 0)
 
     @property
     def url(self) -> str:
